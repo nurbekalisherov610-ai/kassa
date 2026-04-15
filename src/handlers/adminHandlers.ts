@@ -55,6 +55,9 @@ export async function handleAdminCommand(ctx: MyContext) {
                 : `   🎉 *MAQSADGA ERISHILDI!*\n`) +
             `\n` +
 
+            `📜 *Barcha davr:*\n` +
+            `   📝 ${stats.allCount} ta savdo | 💰 ${formatMoney(stats.allTotal)}\n\n` +
+
             `🏆 *Top menejerlar:*\n` +
             (topManagers || '_Hali savdolar yo\'q_\n') + `\n` +
 

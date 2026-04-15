@@ -14,6 +14,7 @@ const sheets = google.sheets({ version: 'v4', auth });
 let cachedData: any[][] | null = null;
 let cachedDeals: ParsedDeal[] | null = null;
 let cacheTimestamp = 0;
+let cachedRowOffset = 2; // 2 when header row exists, 1 otherwise
 const CACHE_TTL = 30000; // 30 seconds cache
 
 // ================ COLUMNS ================
@@ -182,7 +183,8 @@ function parseRow(row: any[], index?: number): ParsedDeal {
         const oldPrice = parseFloat((row[6] || '0').toString().replace(/[^0-9.]/g, '')) || 0;
         return {
             timestamp: row[0] || '',
-            dealId: '',
+            // Legacy rows had no stable ID. Use sheet row as deterministic local ID for tracking.
+            dealId: `LEGACY-${index || 0}`,
             clientName: row[1] || '',
             numberOfPeople: 1,
             departureDate: row[2] || '',
@@ -373,12 +375,14 @@ export const sheetsService = {
                 const h = rows[0][0] ? rows[0][0].toString().trim() : '';
                 if (h === 'Vaqt' || h === 'Timestamp' || h === 'ID') {
                     cachedData = rows.slice(1);
+                    cachedRowOffset = 2;
                     cacheTimestamp = now;
                     return cachedData;
                 }
             }
 
             cachedData = rows;
+            cachedRowOffset = 1;
             cacheTimestamp = now;
             return rows;
         } catch (e: any) {
@@ -407,7 +411,7 @@ export const sheetsService = {
 
         const rows = await this.getRawData();
         const parsedDeals = rows
-            .map((r, i) => parseRow(r, i + 2)) // +2: i is 0-based in header-skipped array, row 1=header, so first data row is row 2
+            .map((r, i) => parseRow(r, i + cachedRowOffset))
             .filter(d => d.status !== 'cancelled' && d.dealId && d.timestamp); // Filter empty/invalid rows
 
         console.log(`📊 Parsed ${parsedDeals.length} valid deals`);

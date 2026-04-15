@@ -92,36 +92,77 @@ async function readUsersFromSheet(): Promise<UserDef[]> {
     }
 }
 
-async function writeUsersToSheet(users: UserDef[]): Promise<void> {
-    try {
-        // Clear existing data (keep header)
-        await sheets.spreadsheets.values.clear({
-            spreadsheetId: config.SPREADSHEET_ID,
-            range: `'${USERS_SHEET}'!A2:F1000`,
-        });
+function userToSheetRow(user: UserDef): (string | number)[] {
+    return [
+        user.id,
+        user.name,
+        user.username,
+        user.role,
+        user.lastActive,
+        user.joinedAt,
+    ];
+}
 
-        if (users.length > 0) {
-            const rows = users.map(u => [
-                u.id,
-                u.name,
-                u.username,
-                u.role,
-                u.lastActive,
-                u.joinedAt,
-            ]);
+async function findUserRowIndex(userId: number): Promise<number | null> {
+    try {
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: config.SPREADSHEET_ID,
+            range: `'${USERS_SHEET}'!A2:A`,
+        });
+        const rows = res.data.values || [];
+        for (let i = 0; i < rows.length; i++) {
+            if (Number(rows[i]?.[0] || 0) === userId) {
+                return i + 2; // sheet rows are 1-based, data starts at row 2
+            }
+        }
+        return null;
+    } catch (e: any) {
+        console.error('findUserRowIndex error:', e.message);
+        return null;
+    }
+}
+
+async function upsertUserInSheet(user: UserDef): Promise<void> {
+    await ensureUsersSheet();
+    const rowIndex = await findUserRowIndex(user.id);
+    const values = [userToSheetRow(user)];
+
+    try {
+        if (rowIndex) {
             await sheets.spreadsheets.values.update({
                 spreadsheetId: config.SPREADSHEET_ID,
-                range: `'${USERS_SHEET}'!A2:F${1 + users.length}`,
+                range: `'${USERS_SHEET}'!A${rowIndex}:F${rowIndex}`,
                 valueInputOption: 'USER_ENTERED',
-                requestBody: { values: rows },
+                requestBody: { values },
             });
+            return;
         }
 
-        // Invalidate cache
-        usersCache = users;
-        usersCacheTs = Date.now();
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: config.SPREADSHEET_ID,
+            range: `'${USERS_SHEET}'!A:F`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values },
+        });
     } catch (e: any) {
-        console.error('writeUsersToSheet error:', e.message);
+        console.error('upsertUserInSheet error:', e.message);
+    }
+}
+
+async function clearUserRowInSheet(userId: number): Promise<boolean> {
+    await ensureUsersSheet();
+    const rowIndex = await findUserRowIndex(userId);
+    if (!rowIndex) return false;
+
+    try {
+        await sheets.spreadsheets.values.clear({
+            spreadsheetId: config.SPREADSHEET_ID,
+            range: `'${USERS_SHEET}'!A${rowIndex}:F${rowIndex}`,
+        });
+        return true;
+    } catch (e: any) {
+        console.error('clearUserRowInSheet error:', e.message);
+        return false;
     }
 }
 
@@ -151,17 +192,15 @@ export const userService = {
     },
 
     async saveUser(user: Omit<UserDef, 'joinedAt' | 'role'> & { role?: string }): Promise<void> {
-        const users = await this.getUsers();
-        const index = users.findIndex(u => u.id === user.id);
+        const existing = await this.getUserById(user.id);
+        let nextUser: UserDef;
 
-        if (index >= 0) {
-            const existing = users[index];
+        if (existing) {
             const nameChanged = existing.name !== user.name;
             const usernameChanged = existing.username !== user.username;
-            const roleChanged = user.role && existing.role !== user.role;
+            const roleChanged = !!(user.role && existing.role !== user.role);
 
             // Only update lastActive if it's been more than 5 minutes
-            // This prevents a Sheets write on every single message
             const lastActiveMs = existing.lastActive ? new Date(existing.lastActive).getTime() : 0;
             const lastActiveStale = Date.now() - lastActiveMs > 5 * 60 * 1000;
 
@@ -170,33 +209,46 @@ export const userService = {
                 return;
             }
 
-            users[index] = {
+            nextUser = {
                 ...existing,
                 name: user.name,
                 username: user.username,
                 lastActive: user.lastActive,
-                ...(user.role ? { role: user.role as 'admin' | 'manager' } : {}),
+                role: (user.role as 'admin' | 'manager') || existing.role,
             };
         } else {
-            // New user — always write
-            users.push({
+            nextUser = {
                 id: user.id,
                 name: user.name,
                 username: user.username,
                 role: (user.role as 'admin' | 'manager') || 'manager',
                 lastActive: user.lastActive,
                 joinedAt: new Date().toISOString(),
-            });
+            };
         }
 
-        await writeUsersToSheet(users);
+        await upsertUserInSheet(nextUser);
+
+        if (usersCache) {
+            const idx = usersCache.findIndex(u => u.id === nextUser.id);
+            if (idx >= 0) usersCache[idx] = nextUser;
+            else usersCache.push(nextUser);
+            usersCacheTs = Date.now();
+        } else {
+            usersCacheTs = 0;
+        }
     },
 
     async deleteUser(id: number): Promise<boolean> {
         const users = await this.getUsers();
         const filtered = users.filter(u => u.id !== id);
         if (filtered.length === users.length) return false;
-        await writeUsersToSheet(filtered);
+
+        const removed = await clearUserRowInSheet(id);
+        if (!removed) return false;
+
+        usersCache = filtered;
+        usersCacheTs = Date.now();
         return true;
     },
 

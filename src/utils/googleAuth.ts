@@ -29,6 +29,10 @@ export function buildSheetsAuthOptions(rawCredentials: string): GoogleAuthOption
     }
 
     if (normalized.startsWith('{')) {
+        if (!normalized.endsWith('}')) {
+            console.warn('GOOGLE_CREDENTIALS looks like incomplete JSON. Expected a full one-line JSON object.');
+            return authOptions;
+        }
         try {
             authOptions.credentials = JSON.parse(normalized);
         } catch (error) {
