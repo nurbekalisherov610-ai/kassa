@@ -10,10 +10,6 @@ async function testDataFlow() {
     console.log('🧪 Starting Data Flow Test...\n');
 
     try {
-        console.log('🔌 Test 0: Verifying Google Sheets connection...');
-        const connection = await sheetsService.checkConnection();
-        console.log(`   ✅ Connected to "${connection.spreadsheetTitle}" / "${connection.salesSheetName}"\n`);
-
         // Test 1: Check if we can read data
         console.log('📥 Test 1: Reading data from Sheets...');
         const rawData = await sheetsService.getRawData();
@@ -53,7 +49,6 @@ async function testDataFlow() {
         console.log('📝 Test 6: Creating test deal object...');
         const testDeal: Deal = {
             dealId: 'TEST-' + Date.now(),
-            managerId: 123456789,
             timestamp: new Date().toISOString(),
             managerName: 'Test Manager',
             managerUsername: '@testmanager',

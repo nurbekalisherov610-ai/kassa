@@ -1,10 +1,9 @@
 import { MyContext } from '../types';
-import { config } from '../config';
+import { config, runtimeConfig } from '../config';
 import { sheetsService } from '../services/sheets';
-import { dashboardService } from '../services/dashboardService';
 import { userService } from '../services/userService';
 import { inlineKeyboards } from '../utils/keyboard';
-import { formatMoney, isAdmin, escapeMd, escapeHtml } from '../utils/helpers';
+import { formatMoney, progressBar, isAdmin, escapeMd } from '../utils/helpers';
 import { InlineKeyboard } from 'grammy';
 
 // ================ ADMIN CHECK ================
@@ -22,27 +21,10 @@ export async function handleAdminCommand(ctx: MyContext) {
     }
 
     try {
-        const [stats, leaderboard, monthlyDeals, allDebts, userCount, dataQuality] = await Promise.all([
-            sheetsService.getOverallStats(),
-            sheetsService.getLeaderboard(),
-            sheetsService.getMonthlyDeals(),
-            sheetsService.getDebtDeals(),
-            userService.getUserCount(),
-            sheetsService.getDataQuality(),
-        ]);
-        const monthPaid = monthlyDeals.reduce((sum, deal) => sum + deal.paidAmount, 0);
-        const monthDebt = monthlyDeals.reduce(
-            (sum, deal) => sum + Math.max(0, deal.price - deal.paidAmount),
-            0
-        );
-        const totalDebt = allDebts.reduce(
-            (sum, deal) => sum + Math.max(0, deal.price - deal.paidAmount),
-            0
-        );
-        const dataIssueCount = dataQuality.duplicateDealIds
-            + dataQuality.missingManager
-            + dataQuality.missingClient
-            + dataQuality.invalidAmounts;
+        const stats = await sheetsService.getOverallStats();
+        const leaderboard = await sheetsService.getLeaderboard();
+        const goal = runtimeConfig.monthlyGoal;
+        const pct = goal > 0 ? Math.min(100, Math.round((stats.monthTotal / goal) * 100)) : 0;
 
         // Top 3 managers mini-view
         let topManagers = '';
@@ -51,30 +33,36 @@ export async function handleAdminCommand(ctx: MyContext) {
             topManagers += `${medal} ${m.name}: *${formatMoney(m.total)}* (${m.count} ta)\n`;
         });
 
+        const now = new Date();
+        const daysLeft = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() - now.getDate();
+        const dailyTarget = pct >= 100 ? 0 : Math.round((goal - stats.monthTotal) / Math.max(daysLeft, 1));
+
         const text =
             `🍋 *LEMON TOUR — Admin Panel*\n` +
             `━━━━━━━━━━━━━━━━━━━━\n\n` +
 
-            `📍 *Bugun*  ${stats.todayCount} ta  •  ${formatMoney(stats.todayTotal)}\n` +
-            `📅 *Hafta*  ${stats.weekCount} ta  •  ${formatMoney(stats.weekTotal)}\n\n` +
+            `📊 *Bugun:*\n` +
+            `   📝 ${stats.todayCount} ta savdo | 💰 ${formatMoney(stats.todayTotal)}\n\n` +
 
-            `📆 *Joriy oy*\n` +
-            `   Shartnomalar: *${formatMoney(stats.monthTotal)}* (${stats.monthCount} ta)\n` +
-            `   Tushgan pul: *${formatMoney(monthPaid)}*\n` +
-            `   Ochiq qarz: *${formatMoney(monthDebt)}*\n` +
+            `📅 *Shu hafta:*\n` +
+            `   📝 ${stats.weekCount} ta savdo | 💰 ${formatMoney(stats.weekTotal)}\n\n` +
+
+            `📆 *Shu oy:*\n` +
+            `   📝 ${stats.monthCount} ta savdo | 💰 ${formatMoney(stats.monthTotal)}\n` +
+            `   ${progressBar(stats.monthTotal, goal)}\n` +
+            (pct < 100
+                ? `   📅 ${daysLeft} kun qoldi | 💸 Kuniga ~${formatMoney(dailyTarget)} kerak\n`
+                : `   🎉 *MAQSADGA ERISHILDI!*\n`) +
             `\n` +
 
-            `📜 *Barcha davr*  ${stats.allCount} ta  •  ${formatMoney(stats.allTotal)}\n` +
-            `💳 *Jami ochiq qarz*  ${formatMoney(totalDebt)}\n\n` +
+            `📜 *Barcha davr:*\n` +
+            `   📝 ${stats.allCount} ta savdo | 💰 ${formatMoney(stats.allTotal)}\n\n` +
 
             `🏆 *Top menejerlar:*\n` +
             (topManagers || '_Hali savdolar yo\'q_\n') + `\n` +
 
-            `👥 *Foydalanuvchilar:* ${userCount} ta\n` +
+            `👥 *Foydalanuvchilar:* ${await userService.getUserCount()} ta\n` +
             `👑 *Adminlar:* ${config.ADMIN_IDS.length} ta\n\n` +
-            (dataIssueCount > 0
-                ? `⚠️ *Ma'lumot sifati:* ${dataIssueCount} ta muammo; legacy qatorlar: ${dataQuality.legacyRows}\n\n`
-                : `✅ *Ma'lumot sifati:* asosiy tekshiruvlardan o'tdi\n\n`) +
 
             `_Kerakli amalni tanlang:_`;
 
@@ -100,9 +88,6 @@ export async function handleAdminCallbacks(ctx: MyContext) {
     if (!data?.startsWith('admin:')) return;
 
     const action = data.replace('admin:', '');
-    // Telegram clients keep a loading spinner until callback queries are answered.
-    // Acknowledge before potentially slow Google Sheets reads.
-    await ctx.answerCallbackQuery().catch(() => undefined);
 
     try {
         switch (action) {
@@ -121,8 +106,8 @@ export async function handleAdminCallbacks(ctx: MyContext) {
             case 'users':
                 await handleUsersList(ctx);
                 break;
-            case 'boss_dashboard':
-                await handleBossDashboard(ctx);
+            case 'set_goal':
+                await handleSetGoal(ctx);
                 break;
             case 'broadcast':
                 await handleBroadcastStart(ctx);
@@ -148,28 +133,7 @@ export async function handleAdminCallbacks(ctx: MyContext) {
         await ctx.reply('❌ Xatolik yuz berdi.');
     }
 
-}
-
-async function handleBossDashboard(ctx: MyContext): Promise<void> {
-    const loading = await ctx.reply('⏳ Boss dashboard yangilanmoqda...');
-    try {
-        const result = await dashboardService.refresh();
-        await ctx.api.editMessageText(
-            ctx.chat!.id,
-            loading.message_id,
-            `✅ <b>${escapeHtml(result.sheetName)}</b> yangilandi.\n\n` +
-            `🕒 ${escapeHtml(result.refreshedAt)}\n` +
-            `<a href="${result.spreadsheetUrl}">Google Sheets dashboardni ochish</a>`,
-            { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-        );
-    } catch (error) {
-        console.error('Boss dashboard refresh error:', error);
-        await ctx.api.editMessageText(
-            ctx.chat!.id,
-            loading.message_id,
-            '❌ Dashboard yangilanmadi. Google Sheets ulanishi va ruxsatlarini tekshiring.'
-        );
-    }
+    await ctx.answerCallbackQuery();
 }
 
 // ================ BUGUNGI HISOBOT ================
@@ -291,6 +255,7 @@ async function handleWeeklyReport(ctx: MyContext) {
 async function handleMonthlyReport(ctx: MyContext) {
     const deals = await sheetsService.getMonthlyDeals();
     const leaderboard = await sheetsService.getLeaderboard();
+    const goal = runtimeConfig.monthlyGoal;
 
     let total = 0, totalPeople = 0, totalPaid = 0, totalDebt = 0, debtCount = 0;
     const destMap = new Map<string, { count: number; revenue: number }>();
@@ -313,6 +278,7 @@ async function handleMonthlyReport(ctx: MyContext) {
         }
     });
 
+    const pct = goal > 0 ? Math.min(100, Math.round((total / goal) * 100)) : 0;
     const avg = deals.length > 0 ? Math.round(total / deals.length) : 0;
 
     let text = `📆 *Oylik hisobot:*\n\n`;
@@ -325,10 +291,19 @@ async function handleMonthlyReport(ctx: MyContext) {
     }
     text += `📈 O'rtacha: *${formatMoney(avg)}*\n\n`;
 
+    text += `🎯 *Maqsad:* ${formatMoney(goal)}\n`;
+    text += `${progressBar(total, goal)}\n`;
+    if (pct < 100) {
+        text += `💰 Qoldi: *${formatMoney(goal - total)}*\n\n`;
+    } else {
+        text += `🎉 *Maqsadga erishildi!*\n\n`;
+    }
+
     text += `🏆 *Menejerlar reytingi:*\n`;
     leaderboard.forEach((m, i) => {
         const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-        text += `${medal} *${escapeMd(m.name)}*: ${m.count} ta — ${formatMoney(m.total)}\n`;
+        const mPct = goal > 0 ? Math.round((m.total / goal) * 100) : 0;
+        text += `${medal} *${escapeMd(m.name)}*: ${m.count} ta — ${formatMoney(m.total)} (${mPct}%)\n`;
     });
 
     if (leaderboard.length === 0) {
@@ -376,6 +351,9 @@ async function handleManagerDetail(ctx: MyContext, username: string) {
     const stats = await sheetsService.getManagerStats(username);
     const allTime = await sheetsService.getManagerAllTimeStats(username);
     const deals = await sheetsService.getManagerDeals(username);
+    const goal = runtimeConfig.monthlyGoal;
+    const pct = goal > 0 ? Math.min(100, Math.round((stats.total / goal) * 100)) : 0;
+
     // Find manager name from deals
     const name = deals.length > 0 ? deals[0].managerName : username;
 
@@ -406,6 +384,9 @@ async function handleManagerDetail(ctx: MyContext, username: string) {
     if (topDest) text += `   🌍 Top yo'nalish: *${topDest}* (${topDestCount} ta)\n`;
     text += `\n`;
 
+    text += `🎯 Maqsadga: ${pct}%\n`;
+    text += `${progressBar(stats.total, goal)}\n\n`;
+
     text += `📅 *Barcha vaqt:*\n`;
     text += `   📝 ${allTime.count} ta | 👥 ${allTime.people} kishi | 💰 ${formatMoney(allTime.total)}\n\n`;
 
@@ -434,6 +415,8 @@ async function handleManagerDetailV2(ctx: MyContext, username: string) {
         sheetsService.getManagerClientPortfolio(username),
     ]);
 
+    const goal = runtimeConfig.monthlyGoal;
+    const pct = goal > 0 ? Math.min(100, Math.round((stats.total / goal) * 100)) : 0;
     const name = allDeals[0]?.managerName || monthDeals[0]?.managerName || username;
 
     let bestDeal = 0;
@@ -478,6 +461,8 @@ async function handleManagerDetailV2(ctx: MyContext, username: string) {
     if (bestDeal > 0) text += `   🏅 Eng katta: *${formatMoney(bestDeal)}* (${escapeMd(bestDest)})\n`;
     if (topDest) text += `   🌍 Top yo'nalish: *${escapeMd(topDest)}* (${topDestCount} ta)\n`;
     text += `\n`;
+    text += `🎯 Maqsadga: ${pct}%\n`;
+    text += `${progressBar(stats.total, goal)}\n\n`;
     text += `📜 *Barcha vaqt:*\n`;
     text += `   📝 ${allTime.count} ta | 👥 ${allTime.people} kishi | 💰 ${formatMoney(allTime.total)}\n`;
     text += `   🧑‍🤝‍🧑 Mijozlar: *${portfolio.length} ta* (qarzli: *${debtClients.length} ta*)\n\n`;
@@ -575,6 +560,19 @@ async function handleUsersList(ctx: MyContext) {
     await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: backButton() });
 }
 
+// ================ SET GOAL ================
+
+async function handleSetGoal(ctx: MyContext) {
+    ctx.session.adminStep = 'setGoal';
+    await ctx.reply(
+        '🎯 *Oylik maqsadni belgilash*\n\n' +
+        `Hozirgi maqsad: *${formatMoney(runtimeConfig.monthlyGoal)}*\n\n` +
+        'Yangi maqsadni dollarda kiriting:\n' +
+        '(Masalan: `15000`)',
+        { parse_mode: 'Markdown' }
+    );
+}
+
 // ================ BROADCAST ================
 
 async function handleBroadcastStart(ctx: MyContext) {
@@ -622,6 +620,21 @@ export async function handleAdminTextInput(ctx: MyContext): Promise<boolean> {
     if (!text) return false;
 
     switch (adminStep) {
+        case 'setGoal': {
+            const goal = parseInt(text.replace(/[^0-9]/g, ''), 10);
+            if (isNaN(goal) || goal < 100) {
+                await ctx.reply('⚠️ Noto\'g\'ri raqam! Kamida $100 bo\'lishi kerak.');
+                return true;
+            }
+            runtimeConfig.monthlyGoal = goal;
+            ctx.session.adminStep = 'idle';
+            await ctx.reply(
+                `✅ Oylik maqsad *${formatMoney(goal)}* ga o'zgartirildi!`,
+                { parse_mode: 'Markdown' }
+            );
+            return true;
+        }
+
         case 'broadcast': {
             const users = await userService.getUsers();
             let sent = 0;
@@ -632,8 +645,8 @@ export async function handleAdminTextInput(ctx: MyContext): Promise<boolean> {
                 try {
                     await ctx.api.sendMessage(
                         user.id,
-                        `📢 <b>DIQQAT — E'LON:</b>\n\n${escapeHtml(text)}`,
-                        { parse_mode: 'HTML' }
+                        `📢 *DIQQAT — E'LON:*\n\n${text}`,
+                        { parse_mode: 'Markdown' }
                     );
                     sent++;
                 } catch (e) {

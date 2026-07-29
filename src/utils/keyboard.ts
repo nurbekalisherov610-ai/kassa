@@ -103,7 +103,7 @@ export const inlineKeyboards = {
         .text('👥 Menejer stats', 'admin:manager_stats').row()
         .text('🌍 Yo\'nalishlar', 'admin:top_destinations')
         .text('👥 Foydalanuvchilar', 'admin:users').row()
-        .text('📊 Boss dashboard', 'admin:boss_dashboard').row()
+        .text('🎯 Maqsad belgilash', 'admin:set_goal')
         .text('📢 Xabar yuborish', 'admin:broadcast').row()
         .text('🔔 Hozir eslatma', 'admin:remind_now'),
 };

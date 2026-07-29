@@ -1,13 +1,12 @@
 import { MyContext, Deal } from '../types';
 import { sheetsService } from '../services/sheets';
-import { dashboardService } from '../services/dashboardService';
-import { config } from '../config';
+import { config, runtimeConfig } from '../config';
 import { wizardKb, keyboards } from '../utils/keyboard';
 import {
-    isValidDate, isDateOnOrAfter, isValidPhone, isValidPrice, isValidName,
+    isValidDate, isValidPhone, isValidPrice, isValidName,
     parsePrice, generateDealId, formatMoney,
     renderWizardStep, renderDealCard, renderSuccessMessage,
-    wizardProgress, formatDateTime, escapeHtml,
+    wizardProgress, formatDateTime, progressBar,
 } from '../utils/helpers';
 
 // ================ WIZARD ENGINE ================
@@ -282,10 +281,6 @@ export async function handleWizardText(ctx: MyContext): Promise<boolean> {
                 await sendOrEditWizard(ctx, 'return', 'Noto\'g\'ri format! KK.OO.YYYY kiriting (masalan: 01.04.2026)');
                 return true;
             }
-            if (deal.departureDate && !isDateOnOrAfter(text, deal.departureDate)) {
-                await sendOrEditWizard(ctx, 'return', 'Qaytish sanasi uchish sanasidan oldin bo‘lishi mumkin emas.');
-                return true;
-            }
             deal.returnDate = text;
             ctx.session.step = 'phone';
             await sendOrEditWizard(ctx, 'phone');
@@ -335,17 +330,10 @@ export async function handleWizardText(ctx: MyContext): Promise<boolean> {
 
         case 'paid': {
             await tryDeleteUserMessage(ctx);
-            if (!isValidPrice(text)) {
+            const cleanedPaid = text.replace(/[^0-9.]/g, '');
+            const paidNum = parseFloat(cleanedPaid);
+            if (isNaN(paidNum) || paidNum < 0 || paidNum > 1000000) {
                 await sendOrEditWizard(ctx, 'paid', 'Noto\'g\'ri summa! Faqat raqam kiriting (masalan: 800). 0 ham mumkin.');
-                return true;
-            }
-            const paidNum = parsePrice(text);
-            if (deal.price !== undefined && paidNum > deal.price) {
-                await sendOrEditWizard(
-                    ctx,
-                    'paid',
-                    `To‘langan summa savdo narxidan oshmasligi kerak (${formatMoney(deal.price)}).`
-                );
                 return true;
             }
             deal.paidAmount = paidNum;
@@ -418,20 +406,8 @@ export async function handleWizardText(ctx: MyContext): Promise<boolean> {
             return true;
         }
         case 'editPaid': {
-            if (!isValidPrice(text)) {
-                await sendOrEditWizard(ctx, 'paid', 'Noto‘g‘ri summa.');
-                return true;
-            }
-            const paidAmount = parsePrice(text);
-            if (deal.price !== undefined && paidAmount > deal.price) {
-                await sendOrEditWizard(
-                    ctx,
-                    'paid',
-                    `To‘langan summa savdo narxidan oshmasligi kerak (${formatMoney(deal.price)}).`
-                );
-                return true;
-            }
-            deal.paidAmount = paidAmount;
+            if (!isValidPrice(text)) return true;
+            deal.paidAmount = parsePrice(text);
             ctx.session.step = 'confirm';
             await tryDeleteUserMessage(ctx);
             await sendOrEditWizard(ctx, 'confirm');
@@ -508,11 +484,6 @@ export async function handleWizardCallback(ctx: MyContext): Promise<boolean> {
 
     // Confirm
     if (data === 'wiz:confirm') {
-        if (ctx.session.confirmingDealId) {
-            await ctx.answerCallbackQuery({ text: '⏳ Savdo allaqachon saqlanmoqda...' });
-            return true;
-        }
-        ctx.session.confirmingDealId = deal.dealId || 'pending';
         await ctx.answerCallbackQuery({ text: '✅ Saqlanmoqda...' });
         await handleConfirm(ctx);
         return true;
@@ -597,7 +568,6 @@ async function handleConfirm(ctx: MyContext) {
     const finalDeal: Deal = {
         timestamp,
         dealId: deal.dealId || generateDealId(),
-        managerId: ctx.from?.id || 0,
         clientName: deal.clientName || '',
         numberOfPeople: deal.numberOfPeople || 1,
         departureDate: deal.departureDate || '',
@@ -614,29 +584,23 @@ async function handleConfirm(ctx: MyContext) {
     };
 
     try {
-        try {
-            await ctx.editMessageText('⏳ <b>Savdo saqlanmoqda…</b>', {
-                parse_mode: 'HTML',
-                reply_markup: undefined,
-            });
-        } catch {
-            // The callback may come from an old message; saving can still continue safely.
-        }
-
         // Save to Google Sheets
         await sheetsService.appendDeal(finalDeal);
-        void dashboardService.refresh().catch(error => {
-            console.error('Boss dashboardni yangilashda xatolik:', error);
-        });
 
         // Get today stats for celebration
         const todayDeals = await sheetsService.getTodayDeals();
         const todayTotal = todayDeals.reduce((sum, d) => sum + d.price, 0);
+        const monthlyStats = await sheetsService.getManagerStats(managerUsername);
+        const monthPct = runtimeConfig.monthlyGoal > 0
+            ? Math.round((monthlyStats.total / runtimeConfig.monthlyGoal) * 100)
+            : 0;
+
         // Update wizard message with success
         const successText = renderSuccessMessage(
             finalDeal,
             todayDeals.length,
             todayTotal,
+            monthPct,
         );
 
         try {
@@ -649,26 +613,23 @@ async function handleConfirm(ctx: MyContext) {
         if (config.CHANNEL_ID) {
             const debt = finalDeal.price - finalDeal.paidAmount;
             const channelText =
-                `🍋 <b>YANGI SAVDO — LEMON TOUR</b>\n\n` +
-                `🆔 <code>${escapeHtml(finalDeal.dealId)}</code>\n` +
-                `👤 Mijoz: <b>${escapeHtml(finalDeal.clientName)}</b>\n` +
-                `👥 Odamlar: <b>${finalDeal.numberOfPeople} kishi</b>\n` +
-                `✈️ ${escapeHtml(finalDeal.departureDate)} → ${escapeHtml(finalDeal.returnDate)}\n` +
-                `📞 ${escapeHtml(finalDeal.contact)}\n` +
-                `🌍 <b>${escapeHtml(finalDeal.destination)}</b>\n` +
-                `💰 <b>${formatMoney(finalDeal.price)}</b>\n` +
-                `💳 To'langan: <b>${formatMoney(finalDeal.paidAmount)}</b>\n` +
-                (debt > 0 ? `📉 Qarz: <b>${formatMoney(debt)}</b> ⚠️\n` : `✅ To'liq to'langan\n`) +
-                `📄 Shartnoma: <b>${escapeHtml(finalDeal.contractNumber || '-')}</b>\n` +
-                (finalDeal.notes ? `📝 ${escapeHtml(finalDeal.notes)}\n` : '') +
-                `\n👱 Menejer: <b>${escapeHtml(managerName)}</b>` +
-                (managerUsername ? ` (${escapeHtml(managerUsername)})` : '');
+                `🍋 *YANGI SAVDO — LEMON TOUR*\n\n` +
+                `🆔 \`${finalDeal.dealId}\`\n` +
+                `👤 Mijoz: *${finalDeal.clientName}*\n` +
+                `👥 Odamlar: *${finalDeal.numberOfPeople} kishi*\n` +
+                `✈️ ${finalDeal.departureDate} → ${finalDeal.returnDate}\n` +
+                `📞 ${finalDeal.contact}\n` +
+                `🌍 *${finalDeal.destination}*\n` +
+                `💰 *${formatMoney(finalDeal.price)}*\n` +
+                `💳 To'langan: *${formatMoney(finalDeal.paidAmount)}*\n` +
+                (debt > 0 ? `📉 Qarz: *${formatMoney(debt)}* ⚠️\n` : `✅ To'liq to'langan\n`) +
+                `📄 Shartnoma: *${finalDeal.contractNumber}*\n` +
+                (finalDeal.notes ? `📝 ${finalDeal.notes}\n` : '') +
+                `\n👱 Menejer: *${managerName}*` +
+                (managerUsername ? ` (${managerUsername})` : '');
 
             try {
-                await ctx.api.sendMessage(config.CHANNEL_ID, channelText, {
-                    parse_mode: 'HTML',
-                    message_thread_id: config.CHANNEL_THREAD_ID,
-                });
+                await ctx.api.sendMessage(config.CHANNEL_ID, channelText, { parse_mode: 'Markdown' });
             } catch (e) {
                 console.error('Kanalga yuborishda xatolik:', e);
             }
@@ -677,19 +638,15 @@ async function handleConfirm(ctx: MyContext) {
         // Show main menu
         await ctx.reply('🍋 Davom eting:', { reply_markup: keyboards.main });
 
-        ctx.session.step = 'idle';
-        ctx.session.tempDeal = {};
-        ctx.session.wizardMessageId = undefined;
-
     } catch (e) {
         console.error('Savdoni saqlashda xatolik:', e);
-        ctx.session.step = 'confirm';
-        await sendOrEditWizard(
-            ctx,
-            'confirm',
-            'Google Sheets bilan aloqa bo‘lmadi. Ma’lumot saqlanmadi; qayta tasdiqlang.'
-        );
-    } finally {
-        ctx.session.confirmingDealId = undefined;
+        await ctx.reply('❌ Saqlashda xatolik yuz berdi. Qayta urinib ko\'ring.', {
+            reply_markup: keyboards.main,
+        });
     }
+
+    // Reset session
+    ctx.session.step = 'idle';
+    ctx.session.tempDeal = {};
+    ctx.session.wizardMessageId = undefined;
 }

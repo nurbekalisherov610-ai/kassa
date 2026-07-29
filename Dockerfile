@@ -1,19 +1,11 @@
-FROM node:22-alpine AS build
+FROM node:18-alpine
 
 WORKDIR /usr/src/app
-COPY package.json package-lock.json ./
-RUN npm ci
-COPY tsconfig.json ./
-COPY src ./src
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS runtime
-
-ENV NODE_ENV=production
-WORKDIR /usr/src/app
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
-COPY --from=build /usr/src/app/dist ./dist
-
-USER node
-CMD ["node", "dist/bot.js"]
+CMD ["npm", "start"]

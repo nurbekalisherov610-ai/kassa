@@ -13,7 +13,6 @@ async function main() {
             timestamp: new Date().toISOString(),
             managerName: 'Test Bot',
             managerUsername: 'testbot',
-            managerId: 1,
             clientName: 'Diagnostic Test',
             numberOfPeople: 1,
             departureDate: '2026-01-01',

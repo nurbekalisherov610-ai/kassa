@@ -16,7 +16,6 @@ let cachedDeals: ParsedDeal[] | null = null;
 let cacheTimestamp = 0;
 let cachedRowOffset = 2; // 2 when header row exists, 1 otherwise
 const CACHE_TTL = 30000; // 30 seconds cache
-const pendingAppends = new Map<string, Promise<void>>();
 
 // ================ COLUMNS ================
 // FORMAT v4 (16 columns) - Cleaner Layout:
@@ -39,11 +38,8 @@ const RANGE = 'A:Z';
 const HEADERS = [
     'Vaqt', 'Savdo ID', 'Mijoz', 'Odamlar', 'Uchish sanasi',
     'Qaytish sanasi', 'Telefon', 'Yo\'nalish', 'Narx ($)', 'To\'langan ($)',
-    'Shartnoma raqami', 'Izoh', 'Menejer ismi', 'Menejer username', 'Holat', 'Qarz ($)',
-    'Tasdiq (HA/YO\'Q)', 'Menejer Telegram ID'
+    'Shartnoma raqami', 'Izoh', 'Menejer ismi', 'Menejer username', 'Holat', 'Qarz ($)', 'Tasdiq (HA/YO\'Q)'
 ];
-
-export type SheetRowFormat = 'v4' | 'v3' | 'legacy';
 
 // ================ ROW PARSER ================
 // Automatically detects old (9 col) vs new (13 col) format
@@ -63,10 +59,8 @@ export interface ParsedDeal {
     notes: string;
     managerName: string;
     managerUsername: string;
-    managerId?: number;
     status: string;
     rowIndex?: number; // for updating rows
-    sourceFormat: SheetRowFormat;
 }
 
 export interface ManagerClientPortfolioItem {
@@ -103,8 +97,6 @@ export interface ManagerDebtSummary {
     topCases: ManagerDebtCase[];
 }
 
-export type ManagerIdentity = string | { id?: number; username?: string };
-
 function parseRow(row: any[], index?: number): ParsedDeal {
     const len = row.length;
     // Simple detection:
@@ -139,9 +131,7 @@ function parseRow(row: any[], index?: number): ParsedDeal {
             status: row[13] || 'confirmed',
             numberOfPeople: parseInt(row[14]) || 1,
             managerUsername: row[15] || '',
-            managerId: Number(row[16]) || undefined,
             rowIndex: index,
-            sourceFormat: 'v4',
         };
     } else if (isV3) {
         // v3 format (15 columns)
@@ -160,10 +150,8 @@ function parseRow(row: any[], index?: number): ParsedDeal {
             notes: row[11] || '',
             managerName: row[12] || '',
             managerUsername: row[13] || '',
-            managerId: Number(row[17]) || undefined,
             status: row[14] || 'confirmed',
             rowIndex: index,
-            sourceFormat: 'v3',
         };
     } else if (len >= 10 && col1.startsWith('LT-')) {
         // Fallback for V2 (13 columns) - similar to V3 but fewer cols?
@@ -189,7 +177,6 @@ function parseRow(row: any[], index?: number): ParsedDeal {
             managerUsername: row[11] || '',
             status: row[12] || 'confirmed',
             rowIndex: index,
-            sourceFormat: 'v3',
         };
     } else {
         // Old format (9 columns) - ID missing or different
@@ -212,7 +199,6 @@ function parseRow(row: any[], index?: number): ParsedDeal {
             managerUsername: row[8] || '',
             status: 'confirmed',
             rowIndex: index,
-            sourceFormat: 'legacy',
         };
     }
 }
@@ -234,22 +220,6 @@ function usernameMatch(a: string, b: string): boolean {
     }
 
     return match;
-}
-
-function managerMatch(deal: ParsedDeal, identity: ManagerIdentity): boolean {
-    if (typeof identity === 'string') {
-        return usernameMatch(deal.managerUsername, identity);
-    }
-    if (identity.id && deal.managerId) {
-        return deal.managerId === identity.id;
-    }
-    return usernameMatch(deal.managerUsername, identity.username || '');
-}
-
-function identityLabel(identity: ManagerIdentity): string {
-    return typeof identity === 'string'
-        ? identity
-        : `${identity.username || 'no-username'}#${identity.id || 'no-id'}`;
 }
 
 function normalizeContact(contact: string): string {
@@ -362,32 +332,17 @@ function sortDealsByTimestampDesc<T extends { timestamp: string }>(deals: T[]): 
 // ================ HELPERS ================
 
 async function getSheetName(): Promise<string> {
-    const meta = await sheets.spreadsheets.get({ spreadsheetId: config.SPREADSHEET_ID });
-    const title = meta.data.sheets?.find(
-        sheet => sheet.properties?.title !== config.DASHBOARD_SHEET_NAME
-            && sheet.properties?.title !== 'Users'
-            && sheet.properties?.title !== 'Settings'
-    )?.properties?.title;
-    if (!title) throw new Error('No sales data sheet was found in the spreadsheet');
-    return title;
+    try {
+        const meta = await sheets.spreadsheets.get({ spreadsheetId: config.SPREADSHEET_ID });
+        return meta.data.sheets?.[0]?.properties?.title || 'Sheet1';
+    } catch {
+        return 'Sheet1';
+    }
 }
 
 // ================ SERVICE ================
 
 export const sheetsService = {
-    async checkConnection(): Promise<{ spreadsheetTitle: string; salesSheetName: string }> {
-        if (!config.SPREADSHEET_ID) {
-            throw new Error('SPREADSHEET_ID is not configured');
-        }
-        const response = await sheets.spreadsheets.get({
-            spreadsheetId: config.SPREADSHEET_ID,
-            fields: 'properties.title,sheets.properties.title',
-        });
-        return {
-            spreadsheetTitle: response.data.properties?.title || 'Untitled spreadsheet',
-            salesSheetName: await getSheetName(),
-        };
-    },
 
     /**
      * Barcha ma'lumotlarni olish (headersiz), parsed
@@ -432,12 +387,13 @@ export const sheetsService = {
             return rows;
         } catch (e: any) {
             console.error('❌ Ma\'lumotlarni olishda xatolik:', e.message);
+            console.error('Error details:', e);
             // Return cached data if available, even if expired
             if (cachedData) {
                 console.log('⚠️ Using stale cached data due to error');
                 return cachedData;
             }
-            throw new Error(`Google Sheets data could not be loaded: ${e.message}`);
+            return [];
         }
     },
 
@@ -464,160 +420,76 @@ export const sheetsService = {
         return parsedDeals;
     },
 
-    async getDataQuality(): Promise<{
-        rows: number;
-        duplicateDealIds: number;
-        missingManager: number;
-        missingClient: number;
-        invalidAmounts: number;
-        legacyRows: number;
-    }> {
-        const rows = await this.getRawData();
-        const deals = rows.map((row, index) => parseRow(row, index + cachedRowOffset));
-        const seenIds = new Set<string>();
-        let duplicateDealIds = 0;
-        let missingManager = 0;
-        let missingClient = 0;
-        let invalidAmounts = 0;
-        let legacyRows = 0;
-
-        deals.forEach(deal => {
-            if (deal.dealId) {
-                if (seenIds.has(deal.dealId)) duplicateDealIds += 1;
-                seenIds.add(deal.dealId);
-            }
-            if (!deal.managerId && !normalizeUsername(deal.managerUsername)) missingManager += 1;
-            if (!deal.clientName.trim()) missingClient += 1;
-            if (
-                !Number.isFinite(deal.price)
-                || !Number.isFinite(deal.paidAmount)
-                || deal.price < 0
-                || deal.paidAmount < 0
-                || deal.paidAmount > deal.price
-            ) {
-                invalidAmounts += 1;
-            }
-            if (deal.sourceFormat === 'legacy') legacyRows += 1;
-        });
-
-        return {
-            rows: deals.length,
-            duplicateDealIds,
-            missingManager,
-            missingClient,
-            invalidAmounts,
-            legacyRows,
-        };
-    },
-
     /**
      * Yangi savdoni yozish
      * IMPROVED: Better validation, error handling, and cache invalidation
      */
     async appendDeal(deal: Deal): Promise<void> {
-        const existingOperation = pendingAppends.get(deal.dealId);
-        if (existingOperation) return existingOperation;
-
-        const operation = this.appendDealOnce(deal);
-        pendingAppends.set(deal.dealId, operation);
-        try {
-            await operation;
-        } finally {
-            pendingAppends.delete(deal.dealId);
-        }
-    },
-
-    async appendDealOnce(deal: Deal): Promise<void> {
         if (!config.SPREADSHEET_ID) {
             console.error('❌ Spreadsheet ID topilmadi — saqlash o\'tkazib yuborildi');
             throw new Error('Spreadsheet ID not configured');
         }
 
         // Validate required fields
-        if (!deal.dealId || !deal.clientName || !Number.isFinite(deal.price) || deal.price <= 0) {
+        if (!deal.dealId || !deal.clientName || !deal.price) {
             console.error('❌ Invalid deal data - missing required fields:', {
                 dealId: deal.dealId,
-                hasClientName: Boolean(deal.clientName),
-                hasValidPrice: Number.isFinite(deal.price) && deal.price > 0,
+                clientName: deal.clientName,
+                price: deal.price
             });
             throw new Error('Invalid deal data: missing required fields');
         }
 
         // Validate manager info
-        if (!deal.managerId || !deal.managerName) {
+        if (!deal.managerName || !deal.managerUsername) {
             console.error('❌ Missing manager information:', {
                 managerName: deal.managerName,
-                managerUsername: deal.managerUsername,
-                managerId: deal.managerId,
+                managerUsername: deal.managerUsername
             });
             throw new Error('Invalid deal data: missing manager information');
         }
 
         try {
-            const duplicate = (await this.getRawData())
-                .map((row, index) => parseRow(row, index + cachedRowOffset))
-                .some(existing => existing.dealId === deal.dealId);
-            if (duplicate) {
-                console.warn(`Duplicate append ignored for deal ${deal.dealId}`);
-                return;
-            }
-
             const sheetName = await getSheetName();
-            // Ensure headers before detecting the active ledger layout.
-            await this.ensureHeaders(sheetName);
-            const header = await sheets.spreadsheets.values.get({
-                spreadsheetId: config.SPREADSHEET_ID,
-                range: `'${sheetName}'!A1:R1`,
-            });
-            const isV4Layout = header.data.values?.[0]?.[0] === 'ID';
-            const range = isV4Layout
-                ? `'${sheetName}'!A:Q`
-                : `'${sheetName}'!A:R`;
-            const debt = deal.price - (deal.paidAmount || 0);
-            const values = isV4Layout
-                ? [[
-                    deal.dealId,
-                    deal.timestamp,
-                    deal.managerName,
-                    deal.clientName,
-                    deal.contact ? `'${deal.contact}` : '',
-                    deal.destination,
-                    deal.departureDate,
-                    deal.returnDate,
-                    deal.price,
-                    deal.paidAmount || 0,
-                    debt,
-                    deal.contractNumber || '',
-                    deal.notes || '',
-                    deal.status,
-                    deal.numberOfPeople,
-                    deal.managerUsername,
-                    deal.managerId,
-                ]]
-                : [[
-                    deal.timestamp,
-                    deal.dealId,
-                    deal.clientName,
-                    deal.numberOfPeople,
-                    deal.departureDate,
-                    deal.returnDate,
-                    deal.contact ? `'${deal.contact}` : '',
-                    deal.destination,
-                    deal.price,
-                    deal.paidAmount || 0,
-                    deal.contractNumber || '',
-                    deal.notes || '',
-                    deal.managerName,
-                    deal.managerUsername,
-                    deal.status,
-                    debt,
-                    "YO'Q",
-                    deal.managerId,
-                ]];
+            // Use V3 format (17 columns A:Q)
+            const range = `'${sheetName}'!A:Q`;
 
-            console.log(
-                `📝 Saving deal ${deal.dealId} to ${sheetName} (${isV4Layout ? 'v4' : 'canonical v3'} layout)`
-            );
+            console.log(`📝 Saving deal ${deal.dealId} to sheet: ${sheetName}!A:O (V3 format)`);
+            console.log(`📊 Deal details:`, {
+                id: deal.dealId,
+                client: deal.clientName,
+                manager: `${deal.managerName} (${deal.managerUsername})`,
+                price: deal.price,
+                paid: deal.paidAmount,
+                destination: deal.destination
+            });
+
+            // Headersni tekshirish va kerak bo'lsa qo'shish
+            await this.ensureHeaders(sheetName);
+
+            // V3 Order + New Columns:
+            // Vaqt, Savdo ID, Mijoz, Odamlar, Uchish sanasi, Qaytish sanasi,
+            // Telefon, Yo'nalish, Narx ($), To'langan ($), Shartnoma raqami,
+            // Izoh, Menejer ismi, Menejer username, Holat, Qarz, Tasdiq
+            const values = [[
+                deal.timestamp,
+                deal.dealId,
+                deal.clientName,
+                deal.numberOfPeople,
+                deal.departureDate,
+                deal.returnDate,
+                deal.contact ? `'${deal.contact}` : '', // Telefon (prevent formula parsing with ')
+                deal.destination,
+                deal.price,
+                deal.paidAmount || 0,
+                deal.contractNumber || '',
+                deal.notes || '',
+                deal.managerName,
+                deal.managerUsername,
+                deal.status,
+                deal.price - (deal.paidAmount || 0), // Qarz ($)
+                "YO'Q" // Tasdiq (HA/YO'Q) by default
+            ]];
 
             console.log(`📤 Appending row to Sheets...`);
             const res = await sheets.spreadsheets.values.append({
@@ -638,6 +510,7 @@ export const sheetsService = {
 
         } catch (error: any) {
             console.error('❌ Sheets-ga yozishda xatolik:', error.message);
+            console.error('Error details:', error);
             throw error;
         }
     },
@@ -649,7 +522,7 @@ export const sheetsService = {
         try {
             const response = await sheets.spreadsheets.values.get({
                 spreadsheetId: config.SPREADSHEET_ID,
-                range: `'${sheetName}'!A1:R1`,
+                range: `'${sheetName}'!A1:Q1`,
             });
 
             const firstRow = response.data.values?.[0];
@@ -658,25 +531,11 @@ export const sheetsService = {
                 // Only write V3 header if sheet is completely empty
                 await sheets.spreadsheets.values.update({
                     spreadsheetId: config.SPREADSHEET_ID,
-                    range: `'${sheetName}'!A1:R1`,
+                    range: `'${sheetName}'!A1:Q1`,
                     valueInputOption: 'USER_ENTERED',
                     requestBody: { values: [HEADERS] },
                 });
                 console.log('📋 Header qatori yaratildi');
-            } else if (firstRow[0] === 'Vaqt' && !firstRow[17]) {
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: config.SPREADSHEET_ID,
-                    range: `'${sheetName}'!R1`,
-                    valueInputOption: 'RAW',
-                    requestBody: { values: [['Menejer Telegram ID']] },
-                });
-            } else if (firstRow[0] === 'ID' && !firstRow[16]) {
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: config.SPREADSHEET_ID,
-                    range: `'${sheetName}'!Q1`,
-                    valueInputOption: 'RAW',
-                    requestBody: { values: [['Manager Telegram ID']] },
-                });
             }
         } catch (e) {
             console.error('Header tekshirishda xatolik:', e);
@@ -687,8 +546,8 @@ export const sheetsService = {
      * Menejer statistikasi (oylik)
      * IMPROVED: Better logging and debugging for tracking issues
      */
-    async getManagerStats(identity: ManagerIdentity): Promise<{ count: number; total: number; people: number }> {
-        console.log(`🔍 Getting stats for manager: "${identityLabel(identity)}"`);
+    async getManagerStats(username: string): Promise<{ count: number; total: number; people: number }> {
+        console.log(`🔍 Getting stats for manager: "${username}"`);
 
         const deals = await this.getParsedData();
         let count = 0;
@@ -696,14 +555,13 @@ export const sheetsService = {
         let people = 0;
 
         // Normalize the input username for comparison
-        const username = typeof identity === 'string' ? identity : identity.username || '';
         const normalizedInput = normalizeUsername(username);
         console.log(`   Normalized username: "${normalizedInput}"`);
         console.log(`   Total deals in database: ${deals.length}`);
 
         deals.forEach(d => {
             const normalizedDealUser = normalizeUsername(d.managerUsername);
-            const uMatch = managerMatch(d, identity);
+            const uMatch = usernameMatch(d.managerUsername, username);
             const mMatch = isThisMonth(d.timestamp);
 
             if (uMatch && mMatch) {
@@ -715,10 +573,10 @@ export const sheetsService = {
 
         // Debug: show first 3 raw deals to trace matching
         if (count === 0 && deals.length > 0) {
-            console.log(`⚠️ Stats 0 for "${identityLabel(identity)}". Showing recent deals for debugging:`);
+            console.log(`⚠️ Stats 0 for "${username}". Showing recent deals for debugging:`);
             const samples = deals.slice(-5);
             samples.forEach(d => {
-                console.log(`   user="${d.managerUsername}" -> "${normalizeUsername(d.managerUsername)}" ts="${d.timestamp}" match_u=${managerMatch(d, identity)} match_m=${isThisMonth(d.timestamp)}`);
+                console.log(`   user="${d.managerUsername}" -> "${normalizeUsername(d.managerUsername)}" ts="${d.timestamp}" match_u=${usernameMatch(d.managerUsername, username)} match_m=${isThisMonth(d.timestamp)}`);
             });
         } else {
             console.log(`📊 Stats for ${username}: ${count} deals, $${total}, ${people} people`);
@@ -730,14 +588,14 @@ export const sheetsService = {
     /**
      * Manager barcha vaqt statistikasi
      */
-    async getManagerAllTimeStats(identity: ManagerIdentity): Promise<{ count: number; total: number; people: number }> {
+    async getManagerAllTimeStats(username: string): Promise<{ count: number; total: number; people: number }> {
         const deals = await this.getParsedData();
         let count = 0;
         let total = 0;
         let people = 0;
 
         deals.forEach(d => {
-            if (managerMatch(d, identity)) {
+            if (usernameMatch(d.managerUsername, username)) {
                 count++;
                 total += d.price;
                 people += d.numberOfPeople;
@@ -750,32 +608,17 @@ export const sheetsService = {
     /**
      * Top menejerlar reytingi (joriy oy)
      */
-    async getLeaderboard(): Promise<{
-        managerId?: number;
-        name: string;
-        username: string;
-        total: number;
-        count: number;
-    }[]> {
+    async getLeaderboard(): Promise<{ name: string; username: string; total: number; count: number }[]> {
         const deals = await this.getParsedData();
-        const stats = new Map<string, {
-            managerId?: number;
-            name: string;
-            username: string;
-            total: number;
-            count: number;
-        }>();
+        const stats = new Map<string, { name: string; username: string; total: number; count: number }>();
 
         deals.forEach(d => {
             if (!d.managerUsername || !isThisMonth(d.timestamp)) return;
 
-            const key = d.managerId
-                ? `id:${d.managerId}`
-                : `username:${normalizeUsername(d.managerUsername)}`;
+            const key = normalizeUsername(d.managerUsername);
 
             if (!stats.has(key)) {
                 stats.set(key, {
-                    managerId: d.managerId,
                     name: d.managerName, username: d.managerUsername,
                     total: 0, count: 0
                 });
@@ -818,24 +661,24 @@ export const sheetsService = {
     /**
      * Ma'lum managerning savdolari (joriy oy)
      */
-    async getManagerDeals(identity: ManagerIdentity): Promise<ParsedDeal[]> {
+    async getManagerDeals(username: string): Promise<ParsedDeal[]> {
         const deals = await this.getParsedData();
-        return deals.filter(d => managerMatch(d, identity) && isThisMonth(d.timestamp));
+        return deals.filter(d => usernameMatch(d.managerUsername, username) && isThisMonth(d.timestamp));
     },
 
     /**
      * Managerning barcha savdolari
      */
-    async getManagerAllDeals(identity: ManagerIdentity): Promise<ParsedDeal[]> {
+    async getManagerAllDeals(username: string): Promise<ParsedDeal[]> {
         const deals = await this.getParsedData();
-        return deals.filter(d => managerMatch(d, identity));
+        return deals.filter(d => usernameMatch(d.managerUsername, username));
     },
 
     /**
      * Manager bo'yicha all-time mijoz portfeli (personal CRM uchun)
      */
-    async getManagerClientPortfolio(identity: ManagerIdentity): Promise<ManagerClientPortfolioItem[]> {
-        const deals = await this.getManagerAllDeals(identity);
+    async getManagerClientPortfolio(username: string): Promise<ManagerClientPortfolioItem[]> {
+        const deals = await this.getManagerAllDeals(username);
         type PortfolioRow = ManagerClientPortfolioItem & { lastDealTsValue: number };
         const portfolio = new Map<string, PortfolioRow>();
 
@@ -892,12 +735,12 @@ export const sheetsService = {
     /**
      * Managerning all-time savdolaridan qidirish (mijoz/telefon/shartnoma/ID/izoh)
      */
-    async searchManagerDeals(identity: ManagerIdentity, query: string, limit = 20): Promise<ParsedDeal[]> {
+    async searchManagerDeals(username: string, query: string, limit = 20): Promise<ParsedDeal[]> {
         const q = query.trim().toLowerCase();
         if (!q) return [];
 
         const qDigits = normalizeContact(query);
-        const deals = await this.getManagerAllDeals(identity);
+        const deals = await this.getManagerAllDeals(username);
 
         const matches = deals.filter(d => {
             const textMatch =
@@ -925,8 +768,8 @@ export const sheetsService = {
     /**
      * Managerning qarz konspekti (personal/admin dashboard uchun)
      */
-    async getManagerDebtSummary(identity: ManagerIdentity): Promise<ManagerDebtSummary> {
-        const debtDeals = await this.getDebtDeals(identity);
+    async getManagerDebtSummary(username: string): Promise<ManagerDebtSummary> {
+        const debtDeals = await this.getDebtDeals(username);
         let totalDebt = 0;
         let totalPrice = 0;
         let totalPaid = 0;
@@ -1043,6 +886,7 @@ export const sheetsService = {
             return true;
         } catch (e: any) {
             console.error('❌ Savdoni o\'chirishda xatolik:', e.message);
+            console.error('Error details:', e);
             return false;
         }
     },
@@ -1091,12 +935,12 @@ export const sheetsService = {
     /**
      * Qarzli savdolarni olish (price > paidAmount)
      */
-    async getDebtDeals(identity?: ManagerIdentity): Promise<ParsedDeal[]> {
+    async getDebtDeals(username?: string): Promise<ParsedDeal[]> {
         const deals = await this.getParsedData();
         return deals.filter(d => {
             const hasDebt = d.price > d.paidAmount;
-            if (identity) {
-                return hasDebt && managerMatch(d, identity);
+            if (username) {
+                return hasDebt && usernameMatch(d.managerUsername, username);
             }
             return hasDebt;
         });
@@ -1137,16 +981,6 @@ export const sheetsService = {
                 console.warn(`⚠️ Deal ${dealId} has no rowIndex`);
                 return false;
             }
-            if (!Number.isFinite(newPaidAmount) || newPaidAmount < 0 || newPaidAmount > deal.price) {
-                console.warn(
-                    `Invalid payment for ${dealId}: ${newPaidAmount}. Expected a value from 0 to ${deal.price}`
-                );
-                return false;
-            }
-            if (deal.sourceFormat === 'legacy') {
-                console.warn(`Payment update is unavailable for unmigrated legacy deal ${dealId}`);
-                return false;
-            }
 
             const sheetName = await getSheetName();
 
@@ -1161,20 +995,23 @@ export const sheetsService = {
 
             console.log(`🔄 Updating ${range} to $${newPaidAmount}`);
 
-            // Debt is K in v4 and P in the canonical v3-compatible layout.
-            const debtCol = deal.sourceFormat === 'v4' ? 'K' : 'P';
-            const newDebt = Math.max(0, deal.price - newPaidAmount);
-
-            // Send paid amount and debt together so readers never observe a half-updated row.
-            await sheets.spreadsheets.values.batchUpdate({
+            await sheets.spreadsheets.values.update({
                 spreadsheetId: config.SPREADSHEET_ID,
-                requestBody: {
-                    valueInputOption: 'USER_ENTERED',
-                    data: [
-                        { range, values: [[newPaidAmount]] },
-                        { range: `'${sheetName}'!${debtCol}${rowNum}`, values: [[newDebt]] },
-                    ],
-                },
+                range,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: [[newPaidAmount]] },
+            });
+
+            // Also update Qarz column (P)
+            const qarzCol = 'P';
+            const qarzRange = `'${sheetName}'!${qarzCol}${rowNum}`;
+            const newQarz = deal.price - newPaidAmount;
+
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: config.SPREADSHEET_ID,
+                range: qarzRange,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: [[newQarz]] },
             });
 
             console.log(`✅ To'lov yangilandi: ${dealId} → $${newPaidAmount}`);
@@ -1187,6 +1024,7 @@ export const sheetsService = {
             return true;
         } catch (error: any) {
             console.error('❌ To\'lov yangilashda xatolik:', error.message);
+            console.error('Error details:', error);
             return false;
         }
     },
