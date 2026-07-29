@@ -1380,65 +1380,112 @@ async function startApplication(): Promise<void> {
     console.log(`👥 Menejerlar: ${config.MANAGER_IDS.length} ta`);
 
     let ready = false;
+    let stopping = false;
+    let startupTasksStarted = false;
+    let jobsScheduled = false;
     const healthServer = startHealthServer(() => ready);
 
-    const connection = await sheetsService.checkConnection();
-    console.log(`✅ Google Sheets: ${connection.spreadsheetTitle} / ${connection.salesSheetName}`);
-    await userService.initialize();
+    const runStartupTasks = async (): Promise<void> => {
+        try {
+            const connection = await sheetsService.checkConnection();
+            console.log(`✅ Google Sheets: ${connection.spreadsheetTitle} / ${connection.salesSheetName}`);
+        } catch (error) {
+            console.error('⚠️ Google Sheets startup check failed:', error);
+        }
 
-    const botInfo = await bot.api.getMe();
-    const webhookInfo = await bot.api.getWebhookInfo();
-    if (webhookInfo.url) {
-        console.warn('Telegram webhook topildi; long polling bilan to‘qnashmasligi uchun o‘chirilmoqda.');
-        await bot.api.deleteWebhook({ drop_pending_updates: false });
-    }
-    await bot.api.setMyCommands([
-        { command: 'start', description: 'Asosiy menyu' },
-        { command: 'newdeal', description: 'Yangi savdoni kiritish' },
-        { command: 'stats', description: 'Mening statistikam' },
-        { command: 'mydeals', description: 'Mening savdolarim' },
-        { command: 'crm', description: 'Mijozlar va qarz nazorati' },
-        { command: 'qarz', description: 'Ochiq qarzlar' },
-        { command: 'help', description: 'Yordam' },
-    ]);
-    for (const adminId of config.ADMIN_IDS) {
-        await bot.api.setMyCommands(
-            [
-                { command: 'admin', description: 'Boshqaruv paneli' },
-                { command: 'pdfreport', description: 'PDF hisobot' },
+        try {
+            await userService.initialize();
+        } catch (error) {
+            console.error('⚠️ Users sheet initialization failed:', error);
+        }
+
+        try {
+            await bot.api.setMyCommands([
+                { command: 'start', description: 'Asosiy menyu' },
                 { command: 'newdeal', description: 'Yangi savdoni kiritish' },
                 { command: 'stats', description: 'Mening statistikam' },
+                { command: 'mydeals', description: 'Mening savdolarim' },
+                { command: 'crm', description: 'Mijozlar va qarz nazorati' },
+                { command: 'qarz', description: 'Ochiq qarzlar' },
                 { command: 'help', description: 'Yordam' },
-            ],
-            { scope: { type: 'chat', chat_id: adminId } }
-        );
-    }
-    if (config.CHANNEL_ID) {
-        const destination = await bot.api.getChat(config.CHANNEL_ID);
-        console.log(`✅ Savdo guruhi: ${'title' in destination ? destination.title : destination.id}`);
-    }
-    try {
-        const dashboard = await dashboardService.refresh();
-        console.log(`✅ Boss dashboard: ${dashboard.spreadsheetUrl}`);
-    } catch (error) {
-        console.error('⚠️ Boss dashboard startup refresh failed:', error);
-    }
+            ]);
+        } catch (error) {
+            console.error('⚠️ Telegram command registration failed:', error);
+        }
 
-    scheduleJobs();
-    ready = true;
+        for (const adminId of config.ADMIN_IDS) {
+            try {
+                await bot.api.setMyCommands(
+                    [
+                        { command: 'admin', description: 'Boshqaruv paneli' },
+                        { command: 'pdfreport', description: 'PDF hisobot' },
+                        { command: 'newdeal', description: 'Yangi savdoni kiritish' },
+                        { command: 'stats', description: 'Mening statistikam' },
+                        { command: 'help', description: 'Yordam' },
+                    ],
+                    { scope: { type: 'chat', chat_id: adminId } }
+                );
+            } catch (error) {
+                console.error(`⚠️ Admin command registration failed (${adminId}):`, error);
+            }
+        }
+
+        if (config.CHANNEL_ID) {
+            try {
+                const destination = await bot.api.getChat(config.CHANNEL_ID);
+                console.log(`✅ Savdo guruhi: ${'title' in destination ? destination.title : destination.id}`);
+            } catch (error) {
+                console.error('⚠️ Sales channel verification failed:', error);
+            }
+        }
+
+        try {
+            const dashboard = await dashboardService.refresh();
+            console.log(`✅ Boss dashboard: ${dashboard.spreadsheetUrl}`);
+        } catch (error) {
+            console.error('⚠️ Boss dashboard startup refresh failed:', error);
+        }
+    };
 
     const shutdown = async (signal: string) => {
+        if (stopping) return;
+        stopping = true;
         ready = false;
         console.log(`${signal}: bot to'xtatilmoqda...`);
-        await bot.stop();
+        if (bot.isRunning()) {
+            await bot.stop();
+        }
         healthServer?.close();
     };
     process.once('SIGINT', () => void shutdown('SIGINT'));
     process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
-    await bot.start({
-        onStart: () => console.log(`✅ @${botInfo.username} ishga tushdi!`),
-    });
+    while (!stopping) {
+        try {
+            await bot.start({
+                onStart: botInfo => {
+                    ready = true;
+                    console.log(`✅ @${botInfo.username} ishga tushdi!`);
+                    if (!jobsScheduled) {
+                        scheduleJobs();
+                        jobsScheduled = true;
+                    }
+                    if (!startupTasksStarted) {
+                        startupTasksStarted = true;
+                        void runStartupTasks();
+                    }
+                },
+            });
+            if (!stopping) {
+                throw new Error('Telegram polling unexpectedly stopped');
+            }
+        } catch (error) {
+            ready = false;
+            if (stopping) break;
+            console.error('⚠️ Telegram polling stopped; retrying in 5 seconds:', error);
+            await new Promise(resolve => setTimeout(resolve, 5_000));
+        }
+    }
 }
 
 if (require.main === module) {
