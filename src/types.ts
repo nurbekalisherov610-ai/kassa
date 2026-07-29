@@ -4,6 +4,7 @@ export type DealStatus = 'pending' | 'confirmed' | 'cancelled';
 
 export interface Deal {
     dealId: string;
+    managerId: number;
     managerName: string;
     managerUsername: string;
     clientName: string;
@@ -33,7 +34,6 @@ export type WizardStep =
 
 export type AdminStep =
     | 'idle'
-    | 'setGoal'
     | 'broadcast'
     | 'customReminder'
     | 'deleteDeal';
@@ -44,6 +44,7 @@ export interface SessionData {
     tempDeal: Partial<Deal>;
     wizardMessageId?: number;
     debtContractId?: string;  // for debt payment flow
+    confirmingDealId?: string;
 }
 
 export type MyContext = Context & SessionFlavor<SessionData>;

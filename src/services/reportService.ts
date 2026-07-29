@@ -1,6 +1,5 @@
 import PDFDocument from 'pdfkit';
 import { sheetsService } from './sheets';
-import { runtimeConfig } from '../config';
 
 export const reportService = {
     async generateDailyReport(): Promise<Buffer> {
@@ -51,19 +50,8 @@ export const reportService = {
 
                 // 2-chi qator
                 doc.text(`Oylik: ${stats.monthCount} ta ($${stats.monthTotal.toLocaleString()})`, 65, boxTop + 55);
-                doc.text(`Maqsad: $${runtimeConfig.monthlyGoal.toLocaleString()}`, 320, boxTop + 55);
-
-                // Progress
-                const percent = Math.min(100, Math.round((stats.monthTotal / runtimeConfig.monthlyGoal) * 100));
-                doc.text(`Bajarilish: ${percent}%`, 65, boxTop + 75);
-
-                // Progress bar chizish
-                const barX = 200;
-                const barY = boxTop + 77;
-                const barW = 250;
-                const barH = 12;
-                doc.rect(barX, barY, barW, barH).fillAndStroke('#e5e7eb', '#999');
-                doc.rect(barX, barY, barW * (percent / 100), barH).fill(percent >= 100 ? '#22c55e' : '#3b82f6');
+                doc.text(`Barcha davr: ${stats.allCount} ta ($${stats.allTotal.toLocaleString()})`, 320, boxTop + 55);
+                doc.text('Ko‘rsatkichlar tasdiqlangan savdolar asosida hisoblangan.', 65, boxTop + 75);
 
                 doc.y = boxTop + 115;
 
