@@ -192,7 +192,6 @@ GOOGLE_CREDENTIALS='{"type":"service_account",...}'
 CHANNEL_ID=your_channel_id_for_notifications
 ADMIN_IDS=123456789,987654321
 MANAGER_IDS=123456789,987654321,111222333
-MONTHLY_GOAL=10000
 ```
 
 ### Google Sheets Setup

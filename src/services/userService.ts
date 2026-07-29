@@ -52,6 +52,7 @@ async function ensureUsersSheet(): Promise<void> {
         }
     } catch (e) {
         console.error('ensureUsersSheet error:', e);
+        throw e;
     }
 }
 
@@ -88,7 +89,8 @@ async function readUsersFromSheet(): Promise<UserDef[]> {
         return users;
     } catch (e: any) {
         console.error('readUsersFromSheet error:', e.message);
-        return usersCache || [];
+        if (usersCache) return usersCache;
+        throw new Error(`Users sheet could not be loaded: ${e.message}`);
     }
 }
 
@@ -166,12 +168,16 @@ async function clearUserRowInSheet(userId: number): Promise<boolean> {
     }
 }
 
-// Initialize sheet on startup
-ensureUsersSheet().catch(console.error);
-
 // ================ SERVICE ================
 
 export const userService = {
+    async initialize(): Promise<void> {
+        if (!config.SPREADSHEET_ID) {
+            throw new Error('SPREADSHEET_ID is not configured');
+        }
+        await ensureUsersSheet();
+    },
+
     async getUsers(): Promise<UserDef[]> {
         return readUsersFromSheet();
     },

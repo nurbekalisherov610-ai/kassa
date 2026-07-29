@@ -11,6 +11,10 @@ import path from 'path';
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID || config.SPREADSHEET_ID || '';
+const APPLY_CHANGES = process.argv.includes('--apply');
+const CONFIRMED_SPREADSHEET = process.argv
+    .find(arg => arg.startsWith('--confirm-spreadsheet='))
+    ?.split('=')[1];
 const authOptions = buildSheetsAuthOptions(config.GOOGLE_CREDENTIALS);
 
 async function migrate() {
@@ -135,6 +139,30 @@ async function migrate() {
         }
 
         console.log(`\n📦 Migrating ${migratedRows.length} rows...`);
+
+        if (!APPLY_CHANGES || CONFIRMED_SPREADSHEET !== SPREADSHEET_ID) {
+            console.log('\nDRY RUN ONLY — no rows were changed.');
+            console.log(
+                `To apply after reviewing this output, run with --apply ` +
+                `--confirm-spreadsheet=${SPREADSHEET_ID}`
+            );
+            return;
+        }
+
+        // Create a recoverable copy before any destructive rewrite.
+        const backupTitle = `${sheetName} Backup ${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            requestBody: {
+                requests: [{
+                    duplicateSheet: {
+                        sourceSheetId: sheetId,
+                        newSheetName: backupTitle,
+                    },
+                }],
+            },
+        });
+        console.log(`✅ Backup created: ${backupTitle}`);
 
         // 5. Clear the entire sheet EXCEPT the header
         console.log('🧹 Clearing old data (keeping header)...');

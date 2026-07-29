@@ -1,13 +1,15 @@
 import { Bot, session, InputFile, InlineKeyboard } from 'grammy';
-import { config, runtimeConfig } from './config';
+import { createServer, Server } from 'http';
+import { config, runtimeConfig, assertProductionConfig } from './config';
 import { MyContext, SessionData } from './types';
 import { startWizard, handleWizardText, handleWizardCallback } from './scenes/dealWizard';
 import { userService } from './services/userService';
 import { sheetsService } from './services/sheets';
 import { reportService } from './services/reportService';
+import { dashboardService } from './services/dashboardService';
 import { handleAdminCommand, handleAdminCallbacks, handleAdminTextInput } from './handlers/adminHandlers';
 import { keyboards } from './utils/keyboard';
-import { isAdmin, formatMoney, progressBar, escapeMd } from './utils/helpers';
+import { isAdmin, formatMoney, escapeMd, isValidPrice, parsePrice } from './utils/helpers';
 import cron from 'node-cron';
 
 // ================ SESSION ================
@@ -38,27 +40,18 @@ bot.catch((err) => {
 // Logging
 bot.use(async (ctx, next) => {
     const userId = ctx.from?.id;
-    const text = ctx.message?.text || ctx.callbackQuery?.data || '';
-    if (text) {
-        console.log(`[${new Date().toLocaleTimeString('uz-UZ', { timeZone: 'Asia/Tashkent' })}] ${userId} | "${text}"`);
-    }
-    await next();
-});
-
-// User tracking
-bot.use(async (ctx, next) => {
-    if (ctx.from) {
-        try {
-            await userService.saveUser({
-                id: ctx.from.id,
-                name: ctx.from.first_name,
-                username: ctx.from.username || '',
-                role: isAdmin(ctx.from.id, config.ADMIN_IDS) ? 'admin' : undefined,
-                lastActive: new Date().toISOString(),
-            });
-        } catch (e) {
-            console.error('User save xato:', e);
-        }
+    const messageText = ctx.message?.text || '';
+    const callbackData = ctx.callbackQuery?.data || '';
+    if (messageText || callbackData) {
+        const event = callbackData
+            ? `callback:${callbackData.split(':').slice(0, 2).join(':')}`
+            : messageText.startsWith('/')
+                ? `command:${messageText.split(/\s/, 1)[0]}`
+                : `text:${messageText.length}chars`;
+        console.log(
+            `[${new Date().toLocaleTimeString('uz-UZ', { timeZone: config.TIMEZONE })}] ` +
+            `user=${userId || 'unknown'} event=${event}`
+        );
     }
     await next();
 });
@@ -89,6 +82,24 @@ bot.use(async (ctx, next) => {
     await next();
 });
 
+// Track only authorized staff. Unauthorized users must never enter the Users sheet.
+bot.use(async (ctx, next) => {
+    if (ctx.from) {
+        try {
+            await userService.saveUser({
+                id: ctx.from.id,
+                name: ctx.from.first_name,
+                username: ctx.from.username || '',
+                role: isAdmin(ctx.from.id, config.ADMIN_IDS) ? 'admin' : undefined,
+                lastActive: new Date().toISOString(),
+            });
+        } catch (e) {
+            console.error('User save xato:', e);
+        }
+    }
+    await next();
+});
+
 // Session
 bot.use(session({ initial }));
 
@@ -108,9 +119,13 @@ bot.command('start', async (ctx) => {
     let statsLine = '';
     if (username) {
         try {
-            const stats = await sheetsService.getManagerStats(username);
+            const stats = await sheetsService.getManagerStats({ id: ctx.from?.id, username });
             const leaderboard = await sheetsService.getLeaderboard();
-            const rank = leaderboard.findIndex(m => m.username === username) + 1;
+            const rank = leaderboard.findIndex(m =>
+                m.managerId
+                    ? m.managerId === ctx.from?.id
+                    : isSameUsernameLocal(m.username, username)
+            ) + 1;
             const rankIcon = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : rank > 0 ? `${rank}-o'rin` : '';
 
             if (stats.count > 0) {
@@ -261,14 +276,13 @@ bot.on('callback_query:data', async (ctx) => {
 
         if (action === 'pay') {
             const isAdm = isAdmin(ctx.from?.id || 0, config.ADMIN_IDS);
-            const myUsername = ctx.from?.username ? `@${ctx.from.username}` : '';
             const deal = await sheetsService.getDealById(dealId);
             if (!deal) {
                 await ctx.answerCallbackQuery({ text: '❌ Savdo topilmadi!' });
                 return;
             }
 
-            const isOwner = myUsername && isSameUsernameLocal(myUsername, deal.managerUsername);
+            const isOwner = isDealOwner(ctx, deal);
             if (!isAdm && !isOwner) {
                 await ctx.answerCallbackQuery({ text: '⛔ Bu savdo sizga tegishli emas!' });
                 return;
@@ -290,11 +304,10 @@ bot.on('callback_query:data', async (ctx) => {
 
         if (action === 'close') {
             const isAdm = isAdmin(ctx.from?.id || 0, config.ADMIN_IDS);
-            const myUsername = ctx.from?.username ? `@${ctx.from.username}` : '';
             // Full payment — set paidAmount = price
             const deal = await sheetsService.getDealById(dealId);
             if (deal) {
-                const isOwner = myUsername && isSameUsernameLocal(myUsername, deal.managerUsername);
+                const isOwner = isDealOwner(ctx, deal);
                 if (!isAdm && !isOwner) {
                     await ctx.answerCallbackQuery({ text: '⛔ Bu savdo sizga tegishli emas!' });
                     return;
@@ -302,6 +315,9 @@ bot.on('callback_query:data', async (ctx) => {
 
                 const success = await sheetsService.updatePaidAmount(dealId, deal.price);
                 if (success) {
+                    void dashboardService.refresh().catch(error => {
+                        console.error('Boss dashboard refresh error:', error);
+                    });
                     await ctx.answerCallbackQuery({ text: '✅ Qarz yopildi!' });
                     await ctx.reply(
                         `✅ *Qarz to'liq yopildi!*\n\n` +
@@ -355,6 +371,11 @@ bot.on('callback_query:data', async (ctx) => {
 
         if (action === 'delete') {
             const success = await sheetsService.cancelDeal(dealId);
+            if (success) {
+                void dashboardService.refresh().catch(error => {
+                    console.error('Boss dashboard refresh error:', error);
+                });
+            }
             await ctx.reply(success
                 ? `✅ Savdo \`${dealId}\` bekor qilindi.`
                 : '❌ Savdoni bekor qilishda xatolik.',
@@ -392,11 +413,20 @@ bot.on('message:text', async (ctx) => {
             return;
         }
 
-        const cleaned = text.replace(/[^0-9.]/g, '');
-        const amount = parseFloat(cleaned);
+        const amount = parsePrice(text);
 
-        if (isNaN(amount) || amount < 0) {
+        if (!isValidPrice(text) || !Number.isFinite(amount) || amount < 0) {
             await ctx.reply('⚠️ Noto\'g\'ri summa! Faqat raqam kiriting (masalan: 1200)');
+            return;
+        }
+
+        const paymentDeal = await sheetsService.getDealById(dealId);
+        if (!paymentDeal || amount > paymentDeal.price) {
+            await ctx.reply(
+                paymentDeal
+                    ? `⚠️ To'langan summa savdo narxidan oshmasligi kerak (${formatMoney(paymentDeal.price)}).`
+                    : '❌ Savdo topilmadi.'
+            );
             return;
         }
 
@@ -405,6 +435,9 @@ bot.on('message:text', async (ctx) => {
         ctx.session.debtContractId = undefined;
 
         if (success) {
+            void dashboardService.refresh().catch(error => {
+                console.error('Boss dashboard refresh error:', error);
+            });
             const deal = await sheetsService.getDealById(dealId);
             const debt = deal ? deal.price - amount : 0;
             await ctx.reply(
@@ -489,27 +522,21 @@ async function handleStats(ctx: MyContext) {
     const username = ctx.from?.username ? `@${ctx.from.username}` : '';
     const firstName = ctx.from?.first_name || 'Menejer';
 
-    if (!username) {
-        await ctx.reply(
-            '⚠️ Statistika Telegram username asosida ishlaydi.\n' +
-            'Iltimos, Telegram sozlamalarida username o\'rnating.',
-        );
-        return;
-    }
-
     const msg = await ctx.reply(`⏳ *${firstName}*, yuklanmoqda...`, { parse_mode: 'Markdown' });
 
     try {
-        const monthlyStats = await sheetsService.getManagerStats(username);
-        const allTimeStats = await sheetsService.getManagerAllTimeStats(username);
+        const identity = { id: ctx.from?.id, username };
+        const monthlyStats = await sheetsService.getManagerStats(identity);
+        const allTimeStats = await sheetsService.getManagerAllTimeStats(identity);
         const leaderboard = await sheetsService.getLeaderboard();
-        const myDeals = await sheetsService.getManagerDeals(username);
-
-        const goal = runtimeConfig.monthlyGoal;
-        const percent = goal > 0 ? Math.min(100, Math.round((monthlyStats.total / goal) * 100)) : 0;
+        const myDeals = await sheetsService.getManagerDeals(identity);
 
         // Ranking
-        const rank = leaderboard.findIndex(m => m.username === username) + 1;
+        const rank = leaderboard.findIndex(m =>
+            m.managerId
+                ? m.managerId === ctx.from?.id
+                : isSameUsernameLocal(m.username, username)
+        ) + 1;
         const rankText = rank > 0 ?
             (rank === 1 ? '🥇 1-o\'rin' : rank === 2 ? '🥈 2-o\'rin' : rank === 3 ? '🥉 3-o\'rin' : `${rank}-o'rin`) :
             '—';
@@ -534,12 +561,10 @@ async function handleStats(ctx: MyContext) {
         let motivation = '';
         if (monthlyStats.count === 0) {
             motivation = `💪 *${firstName}*, bu oy hali savdo yo'q. Birinchi savdoni bugun qiling!`;
-        } else if (percent >= 100) {
-            motivation = `🎉 *Tabriklaymiz, ${firstName}!* Maqsadga erishdingiz! 🏆`;
-        } else if (percent >= 75) {
-            motivation = `🔥 *${firstName}*, maqsadga oz qoldi!`;
-        } else if (percent >= 50) {
-            motivation = `💪 *${firstName}*, yarmiga yetdingiz!`;
+        } else if (rank === 1) {
+            motivation = `🏆 *${firstName}*, jamoa reytingida yetakchisiz!`;
+        } else if (monthlyStats.count >= 5) {
+            motivation = `🔥 *${firstName}*, bu oy ritmingiz yaxshi — davom eting!`;
         } else {
             motivation = `🚀 *${firstName}*, har bir savdo muhim!`;
         }
@@ -547,7 +572,11 @@ async function handleStats(ctx: MyContext) {
         // Leaderboard
         const topList = leaderboard.slice(0, 5).map((m, i) => {
             const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-            const isMe = m.username === username ? ' ⬅️' : '';
+            const isMe = (
+                m.managerId
+                    ? m.managerId === ctx.from?.id
+                    : isSameUsernameLocal(m.username, username)
+            ) ? ' ⬅️' : '';
             return `${medal} *${escapeMd(m.name)}*: ${m.count} ta — ${formatMoney(m.total)}${isMe}`;
         }).join('\n');
 
@@ -560,9 +589,6 @@ async function handleStats(ctx: MyContext) {
             `   📈 O'rtacha: *${formatMoney(avgDeal)}*\n` +
             (bestDeal > 0 ? `   🏅 Eng katta: *${formatMoney(bestDeal)}* (${escapeMd(bestDest)})\n` : '') +
             (topDest ? `   🌍 Top yo'nalish: *${escapeMd(topDest)}* (${topDestCount} ta)\n` : '') +
-            `\n🎯 *Maqsad:* ${formatMoney(goal)}\n` +
-            `${progressBar(monthlyStats.total, goal)}\n` +
-            `💰 Qoldi: *${formatMoney(Math.max(0, goal - monthlyStats.total))}*\n\n` +
             `📅 *Barcha vaqt:*\n` +
             `   🏷️ ${allTimeStats.count} ta | 👥 ${allTimeStats.people} kishi | 💰 ${formatMoney(allTimeStats.total)}\n\n` +
             `🏆 *Reyting:* (${rankText})\n${topList || '_Ma\'lumot yo\'q_'}\n\n` +
@@ -585,18 +611,14 @@ async function handleMyDeals(ctx: MyContext) {
     const username = ctx.from?.username ? `@${ctx.from.username}` : '';
     const firstName = ctx.from?.first_name || 'Menejer';
 
-    if (!username) {
-        await ctx.reply('⚠️ Username o\'rnatilmagan. Telegram sozlamalarini tekshiring.');
-        return;
-    }
-
     const msg = await ctx.reply(`⏳ *${firstName}*, yuklanmoqda...`, { parse_mode: 'Markdown' });
 
     try {
+        const identity = { id: ctx.from?.id, username };
         const [allDeals, monthStats, debtSummary] = await Promise.all([
-            sheetsService.getManagerAllDeals(username),
-            sheetsService.getManagerStats(username),
-            sheetsService.getManagerDebtSummary(username),
+            sheetsService.getManagerAllDeals(identity),
+            sheetsService.getManagerStats(identity),
+            sheetsService.getManagerDebtSummary(identity),
         ]);
 
         const sortedDeals = sortByTimestampDesc([...allDeals]);
@@ -672,7 +694,9 @@ async function handleDebtList(ctx: MyContext) {
 
     try {
         // Admins see ALL debts, managers see only their own
-        const debts = await sheetsService.getDebtDeals(isAdm ? undefined : username);
+        const debts = await sheetsService.getDebtDeals(
+            isAdm ? undefined : { id: ctx.from?.id, username }
+        );
 
         if (debts.length === 0) {
             const kb = new InlineKeyboard()
@@ -756,6 +780,14 @@ function isSameUsernameLocal(a: string, b: string): boolean {
     return normalizeUsernameLocal(a) === normalizeUsernameLocal(b);
 }
 
+function isDealOwner(ctx: MyContext, deal: { managerId?: number; managerUsername: string }): boolean {
+    if (deal.managerId && ctx.from?.id) {
+        return deal.managerId === ctx.from.id;
+    }
+    const username = ctx.from?.username ? `@${ctx.from.username}` : '';
+    return !!username && isSameUsernameLocal(username, deal.managerUsername);
+}
+
 function shortText(text: string, maxLen = 40): string {
     if (!text) return '';
     if (text.length <= maxLen) return text;
@@ -823,16 +855,6 @@ async function goMainMenu(ctx: MyContext, notice = 'Asosiy menyu ochildi.'): Pro
 }
 
 async function startClientSearch(ctx: MyContext): Promise<void> {
-    const username = ctx.from?.username ? `@${ctx.from.username}` : '';
-
-    if (!username) {
-        await ctx.reply(
-            '⚠️ Qidiruv uchun Telegram username kerak. Sozlamalarda username o\'rnating.',
-            { reply_markup: keyboards.main }
-        );
-        return;
-    }
-
     ctx.session.step = 'clientSearch';
     const kb = new InlineKeyboard().text('❌ Bekor qilish', 'mgr:main');
 
@@ -852,17 +874,13 @@ async function startClientSearch(ctx: MyContext): Promise<void> {
 async function handleClientSearchQuery(ctx: MyContext, query: string): Promise<void> {
     const username = ctx.from?.username ? `@${ctx.from.username}` : '';
 
-    if (!username) {
-        await ctx.reply('⚠️ Qidiruv uchun username kerak.', { reply_markup: keyboards.main });
-        return;
-    }
-
     const cleanQuery = query.trim();
     const queryLower = cleanQuery.toLowerCase();
     const msg = await ctx.reply('⏳ *Qidiruv...*', { parse_mode: 'Markdown' });
 
     try {
-        const allDeals = sortByTimestampDesc(await sheetsService.getManagerAllDeals(username));
+        const identity = { id: ctx.from?.id, username };
+        const allDeals = sortByTimestampDesc(await sheetsService.getManagerAllDeals(identity));
         let results = allDeals;
         let queryLabel = cleanQuery;
 
@@ -900,7 +918,7 @@ async function handleClientSearchQuery(ctx: MyContext, query: string): Promise<v
                 );
                 return;
             }
-            results = await sheetsService.searchManagerDeals(username, cleanQuery, 40);
+            results = await sheetsService.searchManagerDeals(identity, cleanQuery, 40);
         }
 
         results = sortByTimestampDesc([...results]);
@@ -973,29 +991,20 @@ async function handleManagerCRM(ctx: MyContext): Promise<void> {
     const username = ctx.from?.username ? `@${ctx.from.username}` : '';
     const firstName = ctx.from?.first_name || 'Menejer';
 
-    if (!username) {
-        await ctx.reply(
-            '⚠️ CRM panel uchun Telegram username kerak. Sozlamalardan username qo\'ying.',
-            { reply_markup: keyboards.main }
-        );
-        return;
-    }
-
     const msg = await ctx.reply(`⏳ *${firstName}*, CRM ma'lumotlari tayyorlanmoqda...`, {
         parse_mode: 'Markdown',
     });
 
     try {
+        const identity = { id: ctx.from?.id, username };
         const [monthStats, allTimeStats, portfolio, debtSummary, allDeals] = await Promise.all([
-            sheetsService.getManagerStats(username),
-            sheetsService.getManagerAllTimeStats(username),
-            sheetsService.getManagerClientPortfolio(username),
-            sheetsService.getManagerDebtSummary(username),
-            sheetsService.getManagerAllDeals(username),
+            sheetsService.getManagerStats(identity),
+            sheetsService.getManagerAllTimeStats(identity),
+            sheetsService.getManagerClientPortfolio(identity),
+            sheetsService.getManagerDebtSummary(identity),
+            sheetsService.getManagerAllDeals(identity),
         ]);
 
-        const goal = runtimeConfig.monthlyGoal;
-        const monthPct = goal > 0 ? Math.min(100, Math.round((monthStats.total / goal) * 100)) : 0;
         const recentDeals = sortByTimestampDesc([...allDeals]).slice(0, 5);
         const topDebtClients = portfolio.filter(c => c.totalDebt > 0).slice(0, 3);
 
@@ -1004,7 +1013,7 @@ async function handleManagerCRM(ctx: MyContext): Promise<void> {
             `${escapeMd(username)}\n\n` +
             `📊 *Shu oy:*\n` +
             `   📝 ${monthStats.count} ta | 👥 ${monthStats.people} kishi | 💰 ${formatMoney(monthStats.total)}\n` +
-            `   ${progressBar(monthStats.total, goal)} (${monthPct}%)\n\n` +
+            `   📈 O'rtacha savdo: *${formatMoney(monthStats.count > 0 ? monthStats.total / monthStats.count : 0)}*\n\n` +
             `📜 *Barcha vaqt:*\n` +
             `   📝 ${allTimeStats.count} ta | 👥 ${allTimeStats.people} kishi | 💰 ${formatMoney(allTimeStats.total)}\n` +
             `   🧑‍🤝‍🧑 Mijozlar: *${portfolio.length} ta*\n\n` +
@@ -1064,17 +1073,15 @@ async function handleAllClients(ctx: MyContext): Promise<void> {
     const username = ctx.from?.username ? `@${ctx.from.username}` : '';
     const firstName = ctx.from?.first_name || 'Menejer';
 
-    if (!username) {
-        await ctx.reply('⚠️ Username kerak.', { reply_markup: keyboards.main });
-        return;
-    }
-
     const msg = await ctx.reply(`⏳ *${firstName}*, mijozlar ro'yxati yuklanmoqda...`, {
         parse_mode: 'Markdown',
     });
 
     try {
-        const clients = await sheetsService.getManagerClientPortfolio(username);
+        const clients = await sheetsService.getManagerClientPortfolio({
+            id: ctx.from?.id,
+            username,
+        });
         if (clients.length === 0) {
             const kb = new InlineKeyboard()
                 .text('CRM', 'mgr:crm')
@@ -1143,7 +1150,7 @@ async function handleManagerDealDetail(ctx: MyContext, dealId: string): Promise<
         return;
     }
 
-    const isOwner = myUsername && isSameUsernameLocal(myUsername, deal.managerUsername);
+    const isOwner = isDealOwner(ctx, deal);
     if (!isAdm && !isOwner) {
         await ctx.answerCallbackQuery({ text: '⛔ Bu savdo sizga tegishli emas' });
         return;
@@ -1240,7 +1247,7 @@ async function handleManagerCallbacks(ctx: MyContext): Promise<void> {
 function getMorningMotivation(): string {
     const msgs = [
         `Xayrli tong, Lemon Tour jamoasi! ☀️\n\nBugun yangi imkoniyatlar kuni! 💪\n\n_Muvaffaqiyat — har kungi sa'y-harakatlar natijasi!_ 🍋`,
-        `Salom, jamoam! 🍋\n\nYangi kun — yangi savdolar! Bugun ham eng yaxshi versiyangizni ko'rsating!\n\n_Maqsadga intilamiz!_ 🎯`,
+        `Salom, jamoam! 🍋\n\nYangi kun — yangi savdolar! Bugun ham mijozlarga tez, aniq va sifatli xizmat ko'rsating. 🚀`,
         `Xayrli tong! 🌞\n\nBugun ajoyib kun bo'ladi! Har bir mijozga eng yaxshi xizmatni ko'rsatamiz!\n\n_Lemon Tour — doimo eng yaxshi!_ 🍋`,
         `Assalomu alaykum! 🌅\n\nYangi kun, yangi natijalar! Keling, bugun rekord o'rnatamiz! 🏆\n\n_Har bir savdo muhim!_ 💰`,
     ];
@@ -1277,10 +1284,8 @@ async function sendDebtReminders() {
 
     for (const user of users) {
         const username = user.username ? `@${user.username}` : '';
-        if (!username) continue;
-
         try {
-            const debts = await sheetsService.getDebtDeals(username);
+            const debts = await sheetsService.getDebtDeals({ id: user.id, username });
             if (debts.length === 0) continue;
 
             let totalDebt = 0;
@@ -1312,16 +1317,7 @@ async function sendDebtReminders() {
 
 // ================ START ================
 
-if (require.main === module) {
-    console.log('🍋 Lemon Tour Bot v3.1 ishga tushmoqda...');
-    console.log(`👑 Admins: ${config.ADMIN_IDS}`);
-    console.log(`👥 Menejerlar: ${config.MANAGER_IDS.length} ta`);
-    console.log(`🎯 Maqsad: $${runtimeConfig.monthlyGoal}`);
-
-    bot.start({
-        onStart: (info) => console.log(`✅ @${info.username} ishga tushdi!`),
-    });
-
+function scheduleJobs(): void {
     // Morning motivation — Mon-Sat 09:00
     cron.schedule(config.MORNING_REMINDER_CRON, async () => {
         console.log('🌅 Ertalabki motivatsiya...');
@@ -1339,5 +1335,115 @@ if (require.main === module) {
         await sendDebtReminders();
     }, { timezone: config.TIMEZONE });
 
+    // Keep boss reporting synchronized even when rows are edited manually in Sheets.
+    cron.schedule('*/30 * * * *', async () => {
+        try {
+            await dashboardService.refresh();
+        } catch (error) {
+            console.error('Scheduled dashboard refresh error:', error);
+        }
+    }, { timezone: config.TIMEZONE });
+
     console.log(`⏰ Cron: ${config.MORNING_REMINDER_CRON} | ${config.EVENING_REMINDER_CRON} | Qarz: har 2 kunda`);
+}
+
+function startHealthServer(isReady: () => boolean): Server | undefined {
+    const port = Number(process.env.PORT || 0);
+    if (!Number.isSafeInteger(port) || port <= 0) return undefined;
+
+    const server = createServer((request, response) => {
+        if (request.url !== '/health' && request.url !== '/') {
+            response.writeHead(404, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ ok: false, error: 'not_found' }));
+            return;
+        }
+
+        const ready = isReady();
+        response.writeHead(ready ? 200 : 503, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({
+            ok: ready,
+            service: 'lemon-tour-bot',
+            timestamp: new Date().toISOString(),
+        }));
+    });
+    server.listen(port, '0.0.0.0', () => {
+        console.log(`Health endpoint listening on port ${port}`);
+    });
+    return server;
+}
+
+async function startApplication(): Promise<void> {
+    assertProductionConfig();
+
+    console.log('🍋 Lemon Tour Bot v4.0 ishga tushmoqda...');
+    console.log(`👑 Adminlar: ${config.ADMIN_IDS.length} ta`);
+    console.log(`👥 Menejerlar: ${config.MANAGER_IDS.length} ta`);
+
+    let ready = false;
+    const healthServer = startHealthServer(() => ready);
+
+    const connection = await sheetsService.checkConnection();
+    console.log(`✅ Google Sheets: ${connection.spreadsheetTitle} / ${connection.salesSheetName}`);
+    await userService.initialize();
+
+    const botInfo = await bot.api.getMe();
+    const webhookInfo = await bot.api.getWebhookInfo();
+    if (webhookInfo.url) {
+        console.warn('Telegram webhook topildi; long polling bilan to‘qnashmasligi uchun o‘chirilmoqda.');
+        await bot.api.deleteWebhook({ drop_pending_updates: false });
+    }
+    await bot.api.setMyCommands([
+        { command: 'start', description: 'Asosiy menyu' },
+        { command: 'newdeal', description: 'Yangi savdoni kiritish' },
+        { command: 'stats', description: 'Mening statistikam' },
+        { command: 'mydeals', description: 'Mening savdolarim' },
+        { command: 'crm', description: 'Mijozlar va qarz nazorati' },
+        { command: 'qarz', description: 'Ochiq qarzlar' },
+        { command: 'help', description: 'Yordam' },
+    ]);
+    for (const adminId of config.ADMIN_IDS) {
+        await bot.api.setMyCommands(
+            [
+                { command: 'admin', description: 'Boshqaruv paneli' },
+                { command: 'pdfreport', description: 'PDF hisobot' },
+                { command: 'newdeal', description: 'Yangi savdoni kiritish' },
+                { command: 'stats', description: 'Mening statistikam' },
+                { command: 'help', description: 'Yordam' },
+            ],
+            { scope: { type: 'chat', chat_id: adminId } }
+        );
+    }
+    if (config.CHANNEL_ID) {
+        const destination = await bot.api.getChat(config.CHANNEL_ID);
+        console.log(`✅ Savdo guruhi: ${'title' in destination ? destination.title : destination.id}`);
+    }
+    try {
+        const dashboard = await dashboardService.refresh();
+        console.log(`✅ Boss dashboard: ${dashboard.spreadsheetUrl}`);
+    } catch (error) {
+        console.error('⚠️ Boss dashboard startup refresh failed:', error);
+    }
+
+    scheduleJobs();
+    ready = true;
+
+    const shutdown = async (signal: string) => {
+        ready = false;
+        console.log(`${signal}: bot to'xtatilmoqda...`);
+        await bot.stop();
+        healthServer?.close();
+    };
+    process.once('SIGINT', () => void shutdown('SIGINT'));
+    process.once('SIGTERM', () => void shutdown('SIGTERM'));
+
+    await bot.start({
+        onStart: () => console.log(`✅ @${botInfo.username} ishga tushdi!`),
+    });
+}
+
+if (require.main === module) {
+    startApplication().catch(error => {
+        console.error('❌ Bot ishga tushmadi:', error);
+        process.exitCode = 1;
+    });
 }

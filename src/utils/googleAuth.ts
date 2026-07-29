@@ -30,13 +30,15 @@ export function buildSheetsAuthOptions(rawCredentials: string): GoogleAuthOption
 
     if (normalized.startsWith('{')) {
         if (!normalized.endsWith('}')) {
-            console.warn('GOOGLE_CREDENTIALS looks like incomplete JSON. Expected a full one-line JSON object.');
-            return authOptions;
+            throw new Error(
+                'GOOGLE_CREDENTIALS is incomplete. Use a full one-line JSON value in Railway ' +
+                'or a service-account JSON file path locally.'
+            );
         }
         try {
             authOptions.credentials = JSON.parse(normalized);
         } catch (error) {
-            console.error('GOOGLE_CREDENTIALS JSON parsing xatosi', error);
+            throw new Error('GOOGLE_CREDENTIALS contains invalid JSON.');
         }
         return authOptions;
     }

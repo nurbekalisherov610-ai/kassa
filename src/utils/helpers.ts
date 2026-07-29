@@ -1,20 +1,35 @@
 import { config } from '../config';
+import { randomBytes } from 'crypto';
 
 // ================ VALIDATION ================
 
 export function isValidDate(text: string): boolean {
+    return parseDateInput(text) !== null;
+}
+
+export function parseDateInput(text: string): Date | null {
     const match = text.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
-    if (!match) return false;
+    if (!match) return null;
 
     const day = parseInt(match[1], 10);
     const month = parseInt(match[2], 10);
     const year = parseInt(match[3], 10);
+    const currentYear = Number(new Intl.DateTimeFormat('en', {
+        timeZone: config.TIMEZONE,
+        year: 'numeric',
+    }).format(new Date()));
 
-    if (month < 1 || month > 12 || day < 1 || day > 31) return false;
-    if (year < 2024 || year > 2030) return false;
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    if (year < currentYear - 1 || year > currentYear + 10) return null;
 
-    const d = new Date(year, month - 1, day);
-    return d.getDate() === day && d.getMonth() === month - 1;
+    const d = new Date(Date.UTC(year, month - 1, day));
+    return d.getUTCDate() === day && d.getUTCMonth() === month - 1 ? d : null;
+}
+
+export function isDateOnOrAfter(candidate: string, minimum: string): boolean {
+    const candidateDate = parseDateInput(candidate);
+    const minimumDate = parseDateInput(minimum);
+    return !!candidateDate && !!minimumDate && candidateDate.getTime() >= minimumDate.getTime();
 }
 
 export function isValidPhone(text: string): boolean {
@@ -23,7 +38,9 @@ export function isValidPhone(text: string): boolean {
 }
 
 export function isValidPrice(text: string): boolean {
+    if (text.includes('-')) return false;
     const cleaned = text.replace(/[^0-9.]/g, '');
+    if ((cleaned.match(/\./g) || []).length > 1) return false;
     const num = parseFloat(cleaned);
     return !isNaN(num) && num >= 0 && num < 1000000;
 }
@@ -35,15 +52,23 @@ export function isValidName(text: string): boolean {
 // ================ FORMATTING ================
 
 export function parsePrice(text: string): number {
+    if (!isValidPrice(text)) return 0;
     const cleaned = text.replace(/[^0-9.]/g, '');
     return parseFloat(cleaned) || 0;
 }
 
 export function generateDealId(): string {
-    const now = new Date();
-    const dateStr = now.toISOString().split('T')[0].replace(/-/g, '');
-    const rand = Math.floor(1000 + Math.random() * 9000);
-    return `LT-${dateStr}-${rand}`;
+    const dateParts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: config.TIMEZONE,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    }).formatToParts(new Date());
+    const part = (type: Intl.DateTimeFormatPartTypes) =>
+        dateParts.find(item => item.type === type)?.value || '';
+    const dateStr = `${part('year')}${part('month')}${part('day')}`;
+    const suffix = randomBytes(4).toString('hex').toUpperCase();
+    return `LT-${dateStr}-${suffix}`;
 }
 
 export function formatMoney(amount: number): string {
@@ -89,18 +114,16 @@ export function escapeMd(text: string): string {
     return text.replace(/[_*`\[]/g, '\\$&');
 }
 
-export function getTodayString(): string {
-    return new Date().toLocaleDateString('uz-UZ', { timeZone: 'Asia/Tashkent' });
+export function escapeHtml(text: string): string {
+    return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
 }
 
-// ================ VISUAL PROGRESS BAR ================
-
-export function progressBar(current: number, goal: number): string {
-    if (goal <= 0) return '░░░░░░░░░░ 0%';
-    const pct = Math.min(100, Math.round((current / goal) * 100));
-    const filled = Math.round(pct / 10);
-    const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
-    return `${bar} ${pct}%`;
+export function getTodayString(): string {
+    return new Date().toLocaleDateString('uz-UZ', { timeZone: 'Asia/Tashkent' });
 }
 
 export function wizardProgress(step: number, total: number): string {
@@ -129,7 +152,7 @@ export function renderDealCard(deal: {
     lines.push('┌────────────────────────────────┐');
 
     if (deal.clientName)
-        lines.push(`│ 👤 *${deal.clientName}*`);
+        lines.push(`│ 👤 *${escapeMd(deal.clientName)}*`);
     if (deal.numberOfPeople)
         lines.push(`│ 👥 *${deal.numberOfPeople} kishi*`);
     if (deal.departureDate && deal.returnDate)
@@ -137,13 +160,13 @@ export function renderDealCard(deal: {
     else if (deal.departureDate)
         lines.push(`│ ✈️ ${deal.departureDate}`);
     if (deal.contact)
-        lines.push(`│ 📞 ${deal.contact}`);
+        lines.push(`│ 📞 ${escapeMd(deal.contact)}`);
     if (deal.price)
         lines.push(`│ 💰 *${formatMoney(deal.price)}*`);
     if (deal.destination)
-        lines.push(`│ 🌍 ${deal.destination}`);
+        lines.push(`│ 🌍 ${escapeMd(deal.destination)}`);
     if (deal.contractNumber)
-        lines.push(`│ 📄 Shartnoma: *${deal.contractNumber}*`);
+        lines.push(`│ 📄 Shartnoma: *${escapeMd(deal.contractNumber)}*`);
     if (deal.price && deal.paidAmount !== undefined) {
         const debt = deal.price - deal.paidAmount;
         lines.push(`│ 💳 To'langan: *${formatMoney(deal.paidAmount)}*`);
@@ -153,7 +176,7 @@ export function renderDealCard(deal: {
             lines.push(`│ ✅ To'liq to'langan`);
     }
     if (deal.notes)
-        lines.push(`│ 📝 ${deal.notes}`);
+        lines.push(`│ 📝 ${escapeMd(deal.notes)}`);
 
     lines.push('└────────────────────────────────┘');
     return lines.join('\n');
@@ -172,7 +195,7 @@ export function renderWizardStep(
     // Show completed fields
     if (filledFields.length > 0) {
         filledFields.forEach(f => {
-            text += `✅ ${f.icon} ${f.label}: *${f.value}*\n`;
+            text += `✅ ${f.icon} ${escapeMd(f.label)}: *${escapeMd(f.value)}*\n`;
         });
         text += '\n';
     }
@@ -187,14 +210,13 @@ export function renderSuccessMessage(
     deal: any,
     todayCount: number,
     todayTotal: number,
-    monthlyPct: number,
 ): string {
     return (
         `🎉 *SAVDO MUVAFFAQIYATLI!*\n\n` +
         `🆔 \`${deal.dealId}\`\n` +
-        `💰 ${formatMoney(deal.price)} | 🌍 ${deal.destination} | 👥 ${deal.numberOfPeople} kishi\n\n` +
+        `💰 ${formatMoney(deal.price)} | 🌍 ${escapeMd(deal.destination)} | 👥 ${deal.numberOfPeople} kishi\n\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `📊 Bugun: *${todayCount}-savdo* | *${formatMoney(todayTotal)}*\n` +
-        `🎯 Oylik: ${progressBar(monthlyPct, 100)}`
+        `📈 Bugungi savdo oqimi yangilandi`
     );
 }
