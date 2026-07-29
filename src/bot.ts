@@ -33,6 +33,136 @@ export const bot = new Bot<MyContext>(config.BOT_TOKEN || 'dummy_token');
 
 // ================ MIDDLEWARE ================
 
+function accessRequestKeyboard(label = '🔐 Ruxsat so‘rash'): InlineKeyboard {
+    return new InlineKeyboard().text(label, 'access:request');
+}
+
+async function handleAccessRequest(ctx: MyContext): Promise<void> {
+    if (!ctx.from) return;
+
+    try {
+        const result = await userService.requestAccess({
+            id: ctx.from.id,
+            name: ctx.from.first_name || 'Xodim',
+            username: ctx.from.username || '',
+        });
+
+        await ctx.answerCallbackQuery({
+            text: result === 'approved'
+                ? 'Sizda allaqachon ruxsat bor'
+                : result === 'pending'
+                    ? 'So‘rovingiz ko‘rib chiqilmoqda'
+                    : result === 'rejected'
+                        ? 'So‘rov yaqinda rad etilgan'
+                    : 'So‘rov adminga yuborildi',
+        }).catch(() => undefined);
+
+        if (result === 'approved') {
+            await ctx.reply('✅ Sizda ruxsat bor. /start ni bosing.', {
+                reply_markup: keyboards.main,
+            });
+            return;
+        }
+
+        if (result === 'pending') {
+            await ctx.reply(
+                '⏳ *So‘rovingiz ko‘rib chiqilmoqda*\n\nAdmin tasdiqlagach, bot sizga xabar yuboradi.',
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+
+        if (result === 'rejected') {
+            await ctx.reply(
+                '❌ *So‘rovingiz yaqinda rad etilgan*\n\nQayta so‘rov 24 soatdan keyin yuborilishi mumkin. Zarur bo‘lsa, administrator bilan bog‘laning.',
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+
+        const username = ctx.from.username ? `@${escapeMd(ctx.from.username)}` : '_username yo‘q_';
+        const reviewKeyboard = new InlineKeyboard()
+            .text('✅ Tasdiqlash', `access:approve:${ctx.from.id}`)
+            .text('❌ Rad etish', `access:reject:${ctx.from.id}`);
+        const notification =
+            `🔐 *Yangi kirish so‘rovi*\n\n` +
+            `👤 *${escapeMd(ctx.from.first_name || 'Xodim')}*\n` +
+            `🔗 ${username}\n` +
+            `🆔 \`${ctx.from.id}\`\n\n` +
+            `_Faqat haqiqiy Lemon Tour xodimini tasdiqlang._`;
+
+        let delivered = 0;
+        for (const adminId of config.ADMIN_IDS) {
+            try {
+                await bot.api.sendMessage(adminId, notification, {
+                    parse_mode: 'Markdown',
+                    reply_markup: reviewKeyboard,
+                });
+                delivered++;
+            } catch (error) {
+                console.error(`Access request notification failed (${adminId}):`, error);
+            }
+        }
+
+        await ctx.reply(
+            delivered > 0
+                ? '✅ *So‘rov yuborildi*\n\nAdmin tasdiqlagach, bot avtomatik ochiladi.'
+                : '⚠️ So‘rov saqlandi, lekin adminga xabar yetmadi. Admin bilan bog‘laning.',
+            { parse_mode: 'Markdown' }
+        );
+    } catch (error) {
+        console.error('Access request failed:', error);
+        await ctx.answerCallbackQuery({ text: 'So‘rov yuborilmadi' }).catch(() => undefined);
+        await ctx.reply('❌ Kirish so‘rovini saqlab bo‘lmadi. Keyinroq qayta urinib ko‘ring.');
+    }
+}
+
+async function handleAccessDecision(ctx: MyContext, data: string): Promise<void> {
+    if (!isAdmin(ctx.from?.id || 0, config.ADMIN_IDS)) {
+        await ctx.answerCallbackQuery({ text: 'Admin huquqi kerak' });
+        return;
+    }
+
+    const [, action, rawId] = data.split(':');
+    const targetId = Number(rawId);
+    if (!Number.isSafeInteger(targetId) || targetId <= 0) {
+        await ctx.answerCallbackQuery({ text: 'Noto‘g‘ri foydalanuvchi ID' });
+        return;
+    }
+
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    const user = await userService.setAccessRole(
+        targetId,
+        action === 'approve' ? 'manager' : 'rejected'
+    );
+    if (!user) {
+        await ctx.editMessageText(
+            'ℹ️ Bu kirish so‘rovi boshqa admin tomonidan ko‘rib chiqilgan.',
+        ).catch(async () => {
+            await ctx.reply('ℹ️ Bu kirish so‘rovi allaqachon ko‘rib chiqilgan.');
+        });
+        return;
+    }
+
+    const approved = action === 'approve';
+    const resultText = approved
+        ? `✅ *Tasdiqlandi:* ${escapeMd(user.name)}\n🆔 \`${user.id}\``
+        : `❌ *Rad etildi:* ${escapeMd(user.name)}\n🆔 \`${user.id}\``;
+    await ctx.editMessageText(resultText, { parse_mode: 'Markdown' }).catch(async () => {
+        await ctx.reply(resultText, { parse_mode: 'Markdown' });
+    });
+
+    await bot.api.sendMessage(
+        user.id,
+        approved
+            ? '✅ Lemon Tour botiga kirishingiz tasdiqlandi.\n\n/start ni bosing va ishni boshlang.'
+            : '❌ Lemon Tour botiga kirish so‘rovingiz rad etildi.\n\nAgar bu xato bo‘lsa, administrator bilan bog‘laning.',
+        approved ? { reply_markup: keyboards.main } : undefined
+    ).catch(error => {
+        console.error(`Access decision notification failed (${user.id}):`, error);
+    });
+}
+
 bot.catch((err) => {
     console.error('❌ Bot xatosi:', err);
 });
@@ -62,18 +192,36 @@ bot.use(async (ctx, next) => {
     if (!userId) return;
 
     const isAdm = config.ADMIN_IDS.includes(userId);
-    const isManager = config.MANAGER_IDS.includes(userId);
+    let isManager = config.MANAGER_IDS.includes(userId);
+    let accessStatus: Awaited<ReturnType<typeof userService.getAccessStatus>>;
+    if (!isAdm && !isManager) {
+        try {
+            accessStatus = await userService.getAccessStatus(userId);
+            isManager = accessStatus === 'manager';
+        } catch (error) {
+            console.error('Dynamic access check failed:', error);
+        }
+    }
 
-    // If MANAGER_IDS is empty, allow everyone (backward compat)
-    if (config.MANAGER_IDS.length > 0 && !isAdm && !isManager) {
+    // Unknown users stay blocked until an admin approves their in-bot request.
+    if (!isAdm && !isManager) {
+        if (ctx.callbackQuery?.data === 'access:request') {
+            await handleAccessRequest(ctx as MyContext);
+            return;
+        }
         // Only block if they try to interact, not on every update
         if (ctx.message?.text || ctx.callbackQuery) {
+            const pending = accessStatus === 'pending';
             await ctx.reply(
-                `\u26d4 *Sizda ruxsat yo'q*\n\n` +
-                `Bu bot faqat Lemon Tour xodimlari uchun.\n` +
-                `Sizning ID: \`${userId}\`\n\n` +
-                `_Ruxsat olish uchun adminga murojaat qiling._`,
-                { parse_mode: 'Markdown' }
+                pending
+                    ? `⏳ *Kirish so‘rovi kutilmoqda*\n\nAdmin tasdiqlagach sizga xabar keladi.\n\n🆔 \`${userId}\``
+                    : `🔒 *Lemon Tour xodimlar botiga kirish*\n\n` +
+                      `Bu yopiq xizmat. Ishni boshlash uchun admin tasdig‘i kerak.\n\n` +
+                      `🆔 Sizning ID: \`${userId}\``,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: pending ? undefined : accessRequestKeyboard(),
+                }
             );
         }
         return;
@@ -117,25 +265,23 @@ bot.command('start', async (ctx) => {
     const username = ctx.from?.username ? `@${ctx.from.username}` : '';
 
     let statsLine = '';
-    if (username) {
-        try {
-            const stats = await sheetsService.getManagerStats({ id: ctx.from?.id, username });
-            const leaderboard = await sheetsService.getLeaderboard();
-            const rank = leaderboard.findIndex(m =>
-                m.managerId
-                    ? m.managerId === ctx.from?.id
-                    : isSameUsernameLocal(m.username, username)
-            ) + 1;
-            const rankIcon = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : rank > 0 ? `${rank}-o'rin` : '';
+    try {
+        const stats = await sheetsService.getManagerStats({ id: ctx.from?.id, username });
+        const leaderboard = await sheetsService.getLeaderboard();
+        const rank = leaderboard.findIndex(m =>
+            m.managerId
+                ? m.managerId === ctx.from?.id
+                : isSameUsernameLocal(m.username, username)
+        ) + 1;
+        const rankIcon = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : rank > 0 ? `${rank}-o'rin` : '';
 
-            if (stats.count > 0) {
-                statsLine = `\n📊 Bu oy: *${stats.count} ta savdo* | *${formatMoney(stats.total)}*`;
-                if (rankIcon) statsLine += ` | ${rankIcon}`;
-                statsLine += '\n';
-            }
-        } catch {
-            // Stats not critical
+        if (stats.count > 0) {
+            statsLine = `\n📊 Bu oy: *${stats.count} ta savdo* | *${formatMoney(stats.total)}*`;
+            if (rankIcon) statsLine += ` | ${rankIcon}`;
+            statsLine += '\n';
         }
+    } catch {
+        // Stats are helpful, but the home screen must always open.
     }
 
     const text =
@@ -249,6 +395,11 @@ bot.command('help', async (ctx) => {
 
 bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
+
+    if (data.startsWith('access:approve:') || data.startsWith('access:reject:')) {
+        await handleAccessDecision(ctx, data);
+        return;
+    }
 
     // Wizard callbacks (wiz:*)
     if (data.startsWith('wiz:')) {
@@ -488,23 +639,40 @@ bot.on('message:text', async (ctx) => {
     // 5. Button handlers (idle state)
     switch (text) {
         case '🍋 Yangi savdo':
+        case '➕ Yangi savdo':
             await startWizard(ctx);
             break;
 
         case '📊 Mening statistikam':
+        case '📊 Natijalarim':
             await handleStats(ctx);
             break;
 
         case '📋 Mening savdolarim':
+        case '📋 Savdolarim':
             await handleMyDeals(ctx);
             break;
 
         case '👤 Mening CRM':
+        case '👤 Mijozlar va CRM':
             await handleManagerCRM(ctx);
             break;
 
         case '💳 Qarzlar':
+        case '💳 Qarz nazorati':
             await handleDebtList(ctx);
+            break;
+
+        case '❓ Yordam':
+            await ctx.reply(
+                '❓ *Tez yordam*\n\n' +
+                '➕ Yangi savdo — shartnomani bosqichma-bosqich kiriting\n' +
+                '👤 Mijozlar va CRM — mijoz, telefon yoki shartnomani toping\n' +
+                '📊 Natijalarim — savdo va reytingingiz\n' +
+                '💳 Qarz nazorati — ochiq to‘lovlarni boshqaring\n\n' +
+                'To‘liq buyruqlar: /help',
+                { parse_mode: 'Markdown', reply_markup: keyboards.main }
+            );
             break;
 
         default:

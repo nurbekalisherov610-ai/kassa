@@ -4,9 +4,10 @@ import { Keyboard, InlineKeyboard } from 'grammy';
 
 export const keyboards = {
     main: new Keyboard()
-        .text('🍋 Yangi savdo').row()
-        .text('📊 Mening statistikam').text('📋 Mening savdolarim').row()
-        .text('👤 Mening CRM').text('💳 Qarzlar')
+        .text('➕ Yangi savdo').row()
+        .text('👤 Mijozlar va CRM').text('📊 Natijalarim').row()
+        .text('💳 Qarz nazorati').text('📋 Savdolarim').row()
+        .text('❓ Yordam')
         .resized()
         .persistent(),
 
@@ -103,6 +104,7 @@ export const inlineKeyboards = {
         .text('👥 Menejer stats', 'admin:manager_stats').row()
         .text('🌍 Yo\'nalishlar', 'admin:top_destinations')
         .text('👥 Foydalanuvchilar', 'admin:users').row()
+        .text('🔐 Kirish so‘rovlari', 'admin:access_requests').row()
         .text('📊 Boss dashboard', 'admin:boss_dashboard').row()
         .text('📢 Xabar yuborish', 'admin:broadcast').row()
         .text('🔔 Hozir eslatma', 'admin:remind_now'),

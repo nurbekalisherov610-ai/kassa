@@ -48,7 +48,10 @@ MANAGER_IDS
 DASHBOARD_SHEET_NAME  optional
 ```
 
-`MANAGER_IDS` must not be empty in production. The previous backward-compatible behavior allowed any Telegram user into the bot; startup now rejects that unsafe configuration.
+`MANAGER_IDS` must not be empty in production and acts as the bootstrap access list. Unknown
+users remain blocked, but can tap `Ruxsat so‘rash`. An `ADMIN_IDS` user approves or rejects the
+request in Telegram; approved access is persisted in the spreadsheet `Users` tab, so adding a
+new manager does not require editing Railway variables or redeploying.
 
 ## Health check
 

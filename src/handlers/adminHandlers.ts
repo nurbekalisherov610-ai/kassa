@@ -22,12 +22,13 @@ export async function handleAdminCommand(ctx: MyContext) {
     }
 
     try {
-        const [stats, leaderboard, monthlyDeals, allDebts, userCount, dataQuality] = await Promise.all([
+        const [stats, leaderboard, monthlyDeals, allDebts, userCount, pendingUsers, dataQuality] = await Promise.all([
             sheetsService.getOverallStats(),
             sheetsService.getLeaderboard(),
             sheetsService.getMonthlyDeals(),
             sheetsService.getDebtDeals(),
             userService.getUserCount(),
+            userService.getPendingUsers(),
             sheetsService.getDataQuality(),
         ]);
         const monthPaid = monthlyDeals.reduce((sum, deal) => sum + deal.paidAmount, 0);
@@ -72,6 +73,9 @@ export async function handleAdminCommand(ctx: MyContext) {
 
             `👥 *Foydalanuvchilar:* ${userCount} ta\n` +
             `👑 *Adminlar:* ${config.ADMIN_IDS.length} ta\n\n` +
+            (pendingUsers.length > 0
+                ? `🔐 *Kirish so‘rovlari:* ${pendingUsers.length} ta — ko‘rib chiqish kerak\n\n`
+                : '') +
             (dataIssueCount > 0
                 ? `⚠️ *Ma'lumot sifati:* ${dataIssueCount} ta muammo; legacy qatorlar: ${dataQuality.legacyRows}\n\n`
                 : `✅ *Ma'lumot sifati:* asosiy tekshiruvlardan o'tdi\n\n`) +
@@ -120,6 +124,9 @@ export async function handleAdminCallbacks(ctx: MyContext) {
                 break;
             case 'users':
                 await handleUsersList(ctx);
+                break;
+            case 'access_requests':
+                await handleAccessRequests(ctx);
                 break;
             case 'boss_dashboard':
                 await handleBossDashboard(ctx);
@@ -549,6 +556,43 @@ async function handleTopDestinations(ctx: MyContext) {
     });
 
     await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: backButton() });
+}
+
+// ================ ACCESS REQUESTS ================
+
+async function handleAccessRequests(ctx: MyContext) {
+    const pending = await userService.getPendingUsers();
+    if (pending.length === 0) {
+        await ctx.reply(
+            '✅ *Kutilayotgan kirish so‘rovi yo‘q.*',
+            { parse_mode: 'Markdown', reply_markup: backButton() }
+        );
+        return;
+    }
+
+    await ctx.reply(
+        `🔐 *Kirish so‘rovlari: ${pending.length} ta*\n\n` +
+        `_Faqat haqiqiy Lemon Tour xodimlarini tasdiqlang._`,
+        { parse_mode: 'Markdown' }
+    );
+
+    for (const user of pending.slice(0, 20)) {
+        const username = user.username ? `@${escapeMd(user.username)}` : '_username yo‘q_';
+        const keyboard = new InlineKeyboard()
+            .text('✅ Tasdiqlash', `access:approve:${user.id}`)
+            .text('❌ Rad etish', `access:reject:${user.id}`);
+        await ctx.reply(
+            `👤 *${escapeMd(user.name)}*\n` +
+            `🔗 ${username}\n` +
+            `🆔 \`${user.id}\`\n` +
+            `🕒 ${escapeMd(user.joinedAt.slice(0, 16).replace('T', ' '))}`,
+            { parse_mode: 'Markdown', reply_markup: keyboard }
+        );
+    }
+
+    if (pending.length > 20) {
+        await ctx.reply(`Yana ${pending.length - 20} ta so‘rov bor. Keyingi ko‘rish uchun panelni qayta oching.`);
+    }
 }
 
 // ================ USERS LIST ================

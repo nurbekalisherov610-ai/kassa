@@ -8,6 +8,7 @@ Production Telegram workflow for Lemon Tour sales, customer history, payment col
 - Records every sale in Google Sheets with a collision-resistant sale ID and stable Telegram manager ID.
 - Sends new sales to the configured Telegram group or forum topic.
 - Shows personal sales, customers, debt, rankings, and search inside Telegram.
+- Lets new staff request access in Telegram; admins approve or reject requests from the bot.
 - Gives admins daily, weekly, monthly, all-time, manager, destination, and debt views.
 - Builds and refreshes a formatted Google Sheets `Dashboard` tab for management.
 - Exposes `/health` on Railway's assigned `PORT`.
@@ -29,6 +30,11 @@ Optional:
 - `DASHBOARD_SHEET_NAME`: defaults to `Dashboard`.
 
 Never paste pretty-printed multi-line JSON directly after `GOOGLE_CREDENTIALS=` in a local `.env`. Use `GOOGLE_CREDENTIALS=./service-account.json` locally or one-line JSON in Railway.
+
+`ADMIN_IDS` and `MANAGER_IDS` provide the initial trusted access list. After deployment, a new
+manager opens the bot and taps `Ruxsat so‘rash`; an admin can approve the request from the
+notification or from `/admin` → `Kirish so‘rovlari`. Approval is saved in the Google Sheets
+`Users` tab and does not require a Railway configuration change or redeploy.
 
 ## Commands
 

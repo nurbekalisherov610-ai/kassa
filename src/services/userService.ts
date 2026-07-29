@@ -17,7 +17,7 @@ export interface UserDef {
     id: number;
     name: string;
     username: string;
-    role: 'admin' | 'manager';
+    role: UserRole;
     lastActive: string;
     joinedAt: string;
 }
@@ -80,7 +80,7 @@ async function readUsersFromSheet(): Promise<UserDef[]> {
                 id: Number(r[0]),
                 name: r[1] || '',
                 username: r[2] || '',
-                role: (r[3] === 'admin' ? 'admin' : 'manager') as 'admin' | 'manager',
+                role: parseUserRole(r[3]),
                 lastActive: r[4] || '',
                 joinedAt: r[5] || '',
             }));
@@ -103,6 +103,18 @@ function userToSheetRow(user: UserDef): (string | number)[] {
         user.lastActive,
         user.joinedAt,
     ];
+}
+
+export type UserRole = 'admin' | 'manager' | 'pending' | 'rejected';
+
+function parseUserRole(value: unknown): UserRole {
+    return value === 'admin' || value === 'pending' || value === 'rejected'
+        ? value
+        : 'manager';
+}
+
+function isActiveRole(role: UserRole): boolean {
+    return role === 'admin' || role === 'manager';
 }
 
 async function findUserRowIndex(userId: number): Promise<number | null> {
@@ -179,11 +191,15 @@ export const userService = {
     },
 
     async getUsers(): Promise<UserDef[]> {
+        return (await readUsersFromSheet()).filter(user => isActiveRole(user.role));
+    },
+
+    async getAllUsers(): Promise<UserDef[]> {
         return readUsersFromSheet();
     },
 
     async getUserById(id: number): Promise<UserDef | undefined> {
-        const users = await this.getUsers();
+        const users = await readUsersFromSheet();
         return users.find(u => u.id === id);
     },
 
@@ -220,14 +236,14 @@ export const userService = {
                 name: user.name,
                 username: user.username,
                 lastActive: user.lastActive,
-                role: (user.role as 'admin' | 'manager') || existing.role,
+                role: user.role ? parseUserRole(user.role) : existing.role,
             };
         } else {
             nextUser = {
                 id: user.id,
                 name: user.name,
                 username: user.username,
-                role: (user.role as 'admin' | 'manager') || 'manager',
+                role: user.role ? parseUserRole(user.role) : 'manager',
                 lastActive: user.lastActive,
                 joinedAt: new Date().toISOString(),
             };
@@ -246,7 +262,7 @@ export const userService = {
     },
 
     async deleteUser(id: number): Promise<boolean> {
-        const users = await this.getUsers();
+        const users = await readUsersFromSheet();
         const filtered = users.filter(u => u.id !== id);
         if (filtered.length === users.length) return false;
 
@@ -261,5 +277,71 @@ export const userService = {
     async getUserCount(): Promise<number> {
         const users = await this.getUsers();
         return users.length;
+    },
+
+    async getAccessStatus(id: number): Promise<UserRole | undefined> {
+        return (await this.getUserById(id))?.role;
+    },
+
+    async getPendingUsers(): Promise<UserDef[]> {
+        return (await readUsersFromSheet()).filter(user => user.role === 'pending');
+    },
+
+    async requestAccess(user: {
+        id: number;
+        name: string;
+        username: string;
+    }): Promise<'created' | 'pending' | 'approved' | 'rejected'> {
+        const existing = await this.getUserById(user.id);
+        if (existing?.role === 'admin' || existing?.role === 'manager') {
+            return 'approved';
+        }
+        if (existing?.role === 'pending') {
+            return 'pending';
+        }
+        if (
+            existing?.role === 'rejected'
+            && Date.now() - new Date(existing.lastActive).getTime() < 24 * 60 * 60 * 1000
+        ) {
+            return 'rejected';
+        }
+
+        const now = new Date().toISOString();
+        const request: UserDef = {
+            id: user.id,
+            name: user.name,
+            username: user.username,
+            role: 'pending',
+            lastActive: now,
+            joinedAt: existing?.joinedAt || now,
+        };
+        await upsertUserInSheet(request);
+        if (usersCache) {
+            const index = usersCache.findIndex(item => item.id === request.id);
+            if (index >= 0) usersCache[index] = request;
+            else usersCache.push(request);
+            usersCacheTs = Date.now();
+        }
+        return 'created';
+    },
+
+    async setAccessRole(id: number, role: 'manager' | 'rejected'): Promise<UserDef | undefined> {
+        const existing = await this.getUserById(id);
+        // Every admin receives a copy of the request. Only the first decision wins.
+        if (!existing || existing.role !== 'pending') return undefined;
+
+        const updated: UserDef = {
+            ...existing,
+            role,
+            lastActive: new Date().toISOString(),
+        };
+        await upsertUserInSheet(updated);
+        if (usersCache) {
+            const index = usersCache.findIndex(item => item.id === id);
+            if (index >= 0) usersCache[index] = updated;
+            else usersCache.push(updated);
+            usersCacheTs = Date.now();
+        }
+        return updated;
     },
 };
